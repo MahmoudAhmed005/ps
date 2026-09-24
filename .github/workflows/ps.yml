@@ -1,0 +1,28 @@
+name: Interactive shell
+
+on:
+  workflow_dispatch:
+
+jobs:
+  debug-session:
+    runs-on: apline-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Connect Runner to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          hostname: gh-runner-ci
+          args: --ssh --advertise-tags=tag:ci --accept-risk=lose-ssh
+
+      # - name: Start Docker Container
+      #   run: |
+      #     docker run -d --name debug-container ubuntu:latest sleep infinity
+
+      - name: Keep Runner Alive
+        run: |
+          echo "Tailscale is ready. Connecting via: tailscale ssh runner@gh-runner-ci"
+          # Keep alive for ~5 hours and 45 minutes
+          sleep 20700
