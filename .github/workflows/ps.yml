@@ -120,11 +120,16 @@ jobs:
         run: |
           echo "Cloning private backup repository securely..."
           
+          # Strip accidental spaces or newlines from secrets directly in YAML
+          CLEAN_PAT=$(echo "${{ secrets.BACKUP_PAT }}" | tr -d '[:space:]')
+          CLEAN_USER=$(echo "${{ secrets.GH_USERNAME }}" | tr -d '[:space:]')
+          CLEAN_REPO=$(echo "${{ secrets.BACKUP_REPO }}" | tr -d '[:space:]')
+          
           # Temporarily inject the auth helper just for the clone process
-          git config --global credential.helper "!f() { echo \"username=oauth2\"; echo \"password=${{ secrets.BACKUP_PAT }}\"; }; f"
+          git config --global credential.helper "!f() { echo \"username=oauth2\"; echo \"password=${CLEAN_PAT}\"; }; f"
           
           # Clone quietly to avoid any repository metadata leaking to logs
-          git clone --quiet "https://github.com/${{ secrets.GH_USERNAME }}/${{ secrets.BACKUP_REPO }}.git" /tmp/backup-repo || true
+          git clone --quiet "https://github.com/${CLEAN_USER}/${CLEAN_REPO}.git" /tmp/backup-repo || true
           
           # Remove the global credential helper immediately after cloning
           git config --global --unset credential.helper
