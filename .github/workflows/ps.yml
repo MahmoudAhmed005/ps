@@ -66,7 +66,12 @@ jobs:
 
           # Source credentials if not already exported in the shell
           [ -f /home/runner/.mc_env ] && source /home/runner/.mc_env
-
+          
+          # Strip accidental spaces or newlines from secrets
+          BACKUP_PAT=$(echo "${BACKUP_PAT}" | tr -d '[:space:]')
+          GH_USERNAME=$(echo "${GH_USERNAME}" | tr -d '[:space:]')
+          BACKUP_REPO=$(echo "${BACKUP_REPO}" | tr -d '[:space:]')
+          
           if [ ! -d /home/runner/minecraft/data/world ]; then
             echo "No world directory found to back up. Skipping."
             exit 0
