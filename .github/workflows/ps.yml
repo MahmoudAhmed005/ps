@@ -5,7 +5,7 @@ on:
 
 jobs:
   debug-session:
-    runs-on: apline-latest
+    runs-on: ubuutu-latest
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
