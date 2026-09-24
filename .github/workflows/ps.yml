@@ -104,7 +104,7 @@ jobs:
           git commit -m "Backup: $(date -u)"
 
           # Push quietly to prevent Git from logging progress output or errors
-          git push -f --quiet origin main > /dev/null 2>&1
+          git push -f origin main
           
           echo "Backup pushed successfully!"
           EOF
