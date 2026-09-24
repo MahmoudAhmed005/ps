@@ -19,7 +19,7 @@ jobs:
 
       - name: Start Docker Container
         run: |
-          docker run -d --name debug-container ubuntu:latest sleep infinity
+          docker run -d --name debug-container --network host ubuntu:latest sleep infinity
 
       - name: Keep Runner Alive
         run: |
