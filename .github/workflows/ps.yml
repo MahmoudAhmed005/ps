@@ -1,5 +1,5 @@
-name: ps
-          
+name: Ephemeral Minecraft Server
+
 on:
   workflow_dispatch:
 
@@ -49,70 +49,107 @@ jobs:
               stdin_open: true
           EOF
 
-      - name: Generate Backup Script
+      - name: Generate Backup Script and Secrets Env
         run: |
+          # 1. Securely store secrets in a private env file readable by SSH and root
+          cat << EOF > /home/runner/.mc_env
+          export BACKUP_PAT="${{ secrets.BACKUP_PAT }}"
+          export GH_USERNAME="${{ secrets.GH_USERNAME }}"
+          export BACKUP_REPO="${{ secrets.BACKUP_REPO }}"
+          EOF
+          chmod 600 /home/runner/.mc_env
+
+          # 2. Write the backup executable
           cat << 'EOF' > /home/runner/repo-backup.sh
           #!/bin/bash
-          PAT="INJECT_PAT"
-          USERNAME="INJECT_USERNAME"
-          REPO="INJECT_REPO"
-          
-          echo "Saving world state..."
+          set -e
+
+          # Source credentials if not already exported in the shell
+          [ -f /home/runner/.mc_env ] && source /home/runner/.mc_env
+
+          if [ ! -d /home/runner/minecraft/data/world ]; then
+            echo "No world directory found to back up. Skipping."
+            exit 0
+          fi
+
+          echo "Saving Minecraft world state to disk..."
           docker exec mc-server rcon-cli save-all || true
-          
-          mkdir -p /tmp/mc-backup && cd /tmp/mc-backup
+          sleep 3
+
+          echo "Flushing container memory..."
+          docker stop mc-server || true
+
+          mkdir -p /tmp/mc-backup
+          cd /tmp/mc-backup
+
           echo "Compressing world..."
-          tar -czf world.tar.gz -C /home/runner/minecraft/data world/
-          
-          echo "Pushing to GitHub..."
+          sudo tar -czf world.tar.gz -C /home/runner/minecraft/data world/
+          sudo chown runner:runner world.tar.gz
+
+          echo "Pushing archive to private backup repository..."
           rm -rf .git
           git init
-          git branch -M main
+          git config --global --add safe.directory /tmp/mc-backup
+          
+          # Setup dummy user for the commit
           git config user.email "runner@github.actions"
           git config user.name "GitHub Runner"
-          
+          git branch -M main
+
+          # Safely configure authentication without putting the token in the URL
+          git config credential.helper "!f() { echo \"username=oauth2\"; echo \"password=${BACKUP_PAT}\"; }; f"
+          git remote add origin "https://github.com/${GH_USERNAME}/${BACKUP_REPO}.git"
+
           git add world.tar.gz
-          git commit -m "Backup: $(date)"
-          git push -f https://oauth2:${PAT}@github.com/${USERNAME}/${REPO}.git main
-          echo "Backup complete!"
-          EOF
+          git commit -m "Backup: $(date -u)"
+
+          # Push quietly to prevent Git from logging progress output or errors
+          git push -f --quiet origin main > /dev/null 2>&1
           
-          # Inject secrets securely
-          sed -i "s/INJECT_PAT/${{ secrets.BACKUP_PAT }}/g" /home/runner/repo-backup.sh
-          sed -i "s/INJECT_USERNAME/${{ secrets.GH_USERNAME }}/g" /home/runner/repo-backup.sh
-          sed -i "s/INJECT_REPO/${{ secrets.BACKUP_REPO }}/g" /home/runner/repo-backup.sh
+          echo "Backup pushed successfully!"
+          EOF
+
           chmod +x /home/runner/repo-backup.sh
 
       - name: Restore Previous World
         run: |
-          echo "Cloning private backup repository..."
-          # The || true ensures the workflow doesn't crash if the backup repo is currently empty
-          git clone https://oauth2:${{ secrets.BACKUP_PAT }}@github.com/${{ secrets.GH_USERNAME }}/${{ secrets.BACKUP_REPO }}.git /tmp/backup-repo || true
+          echo "Cloning private backup repository securely..."
           
+          # Temporarily inject the auth helper just for the clone process
+          git config --global credential.helper "!f() { echo \"username=oauth2\"; echo \"password=${{ secrets.BACKUP_PAT }}\"; }; f"
+          
+          # Clone quietly to avoid any repository metadata leaking to logs
+          git clone --quiet "https://github.com/${{ secrets.GH_USERNAME }}/${{ secrets.BACKUP_REPO }}.git" /tmp/backup-repo || true
+          
+          # Remove the global credential helper immediately after cloning
+          git config --global --unset credential.helper
+
           if [ -f /tmp/backup-repo/world.tar.gz ]; then
             echo "Extracting world data..."
             mkdir -p /home/runner/minecraft/data
-            tar -xzf /tmp/backup-repo/world.tar.gz -C /home/runner/minecraft/data
+            sudo tar -xzf /tmp/backup-repo/world.tar.gz -C /home/runner/minecraft/data
+            # Grant full read/write permissions so Docker UID 1000 can freely access the restored world
+            sudo chmod -R 777 /home/runner/minecraft/data
             echo "World restored successfully!"
           else
-            echo "No previous backup found. A fresh world will be generated."
+            echo "No existing backup found. A fresh world will be generated on boot."
           fi
 
       - name: Keep Runner Alive (Soft Timeout)
-        # Forces this step to fail after 350 minutes, triggering the backup step
         timeout-minutes: 350
         run: |
           echo "=========================================================="
-          echo "Server prepped! Connect via: tailscale ssh runner@gh-runner-ci"
-          echo "Start server with: cd ~/minecraft && docker compose up -d"
+          echo "Runner is live on Tailnet!"
+          echo "Connect via: tailscale ssh runner@gh-runner-ci"
+          echo "Start server: cd ~/minecraft && docker compose up -d"
+          echo "Manual backup: ~/repo-backup.sh"
           echo "=========================================================="
           sleep infinity
 
       - name: Auto-Backup World Before Shutdown
-        # The always() condition guarantees this runs even when the timeout kills the sleep command
         if: always()
         run: |
-          echo "Initiating emergency backup..."
+          echo "Triggering automated backup sequence..."
           if [ -f /home/runner/repo-backup.sh ]; then
             /home/runner/repo-backup.sh
           else
