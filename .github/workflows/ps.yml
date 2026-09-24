@@ -1,10 +1,10 @@
-name: Interactive shell
-
+name: ps
+          
 on:
   workflow_dispatch:
 
 jobs:
-  debug-session:
+  minecraft-session:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
@@ -17,12 +17,104 @@ jobs:
           hostname: gh-runner-ci
           args: --ssh --advertise-tags=tag:ci --accept-risk=lose-ssh --accept-dns
 
-      - name: Start Docker Container
+      - name: Force Strict Tailscale DNS
         run: |
-          docker run -d --name debug-container --network host ubuntu:latest sleep infinity
+          sudo unlink /etc/resolv.conf
+          echo "nameserver 100.100.100.100" | sudo tee /etc/resolv.conf
+          echo "options edns0 trust-ad" | sudo tee -a /etc/resolv.conf
+          sudo chattr +i /etc/resolv.conf
 
-      - name: Keep Runner Alive
+      - name: Generate Docker Compose
         run: |
-          echo "Tailscale is ready. Connecting via: tailscale ssh runner@gh-runner-ci"
-          # Keep alive for ~5 hours and 45 minutes
-          sleep 20700
+          mkdir -p /home/runner/minecraft
+          cat << 'EOF' > /home/runner/minecraft/docker-compose.yml
+          services:
+            mc:
+              image: itzg/minecraft-server
+              container_name: mc-server
+              ports:
+                - "25565:25565"
+              environment:
+                EULA: "TRUE"
+                TYPE: "NEOFORGE"
+                VERSION: "1.21.1"
+                ONLINE_MODE: "FALSE"
+                MEMORY: "8G"
+                MAX_TICK_TIME: "-1"
+                JVM_OPTS: "-XX:+UseG1GC -XX:+ParallelRefProcEnabled -XX:MaxGCPauseMillis=200 -XX:+UnlockExperimentalVMOptions -XX:+DisableExplicitGC -XX:+AlwaysPreTouch -XX:G1NewSizePercent=30 -XX:G1MaxNewSizePercent=40 -XX:G1HeapRegionSize=8M -XX:G1ReservePercent=20 -XX:G1HeapWastePercent=5 -XX:G1MixedGCCountTarget=4 -Dfml.readTimeout=180"
+              volumes:
+                - ./data:/data
+              restart: unless-stopped
+              tty: true
+              stdin_open: true
+          EOF
+
+      - name: Generate Backup Script
+        run: |
+          cat << 'EOF' > /home/runner/repo-backup.sh
+          #!/bin/bash
+          PAT="INJECT_PAT"
+          USERNAME="INJECT_USERNAME"
+          REPO="INJECT_REPO"
+          
+          echo "Saving world state..."
+          docker exec mc-server rcon-cli save-all || true
+          
+          mkdir -p /tmp/mc-backup && cd /tmp/mc-backup
+          echo "Compressing world..."
+          tar -czf world.tar.gz -C /home/runner/minecraft/data world/
+          
+          echo "Pushing to GitHub..."
+          rm -rf .git
+          git init
+          git branch -M main
+          git config user.email "runner@github.actions"
+          git config user.name "GitHub Runner"
+          
+          git add world.tar.gz
+          git commit -m "Backup: $(date)"
+          git push -f https://oauth2:${PAT}@github.com/${USERNAME}/${REPO}.git main
+          echo "Backup complete!"
+          EOF
+          
+          # Inject secrets securely
+          sed -i "s/INJECT_PAT/${{ secrets.BACKUP_PAT }}/g" /home/runner/repo-backup.sh
+          sed -i "s/INJECT_USERNAME/${{ secrets.GH_USERNAME }}/g" /home/runner/repo-backup.sh
+          sed -i "s/INJECT_REPO/${{ secrets.BACKUP_REPO }}/g" /home/runner/repo-backup.sh
+          chmod +x /home/runner/repo-backup.sh
+
+      - name: Restore Previous World
+        run: |
+          echo "Cloning private backup repository..."
+          # The || true ensures the workflow doesn't crash if the backup repo is currently empty
+          git clone https://oauth2:${{ secrets.BACKUP_PAT }}@github.com/${{ secrets.GH_USERNAME }}/${{ secrets.BACKUP_REPO }}.git /tmp/backup-repo || true
+          
+          if [ -f /tmp/backup-repo/world.tar.gz ]; then
+            echo "Extracting world data..."
+            mkdir -p /home/runner/minecraft/data
+            tar -xzf /tmp/backup-repo/world.tar.gz -C /home/runner/minecraft/data
+            echo "World restored successfully!"
+          else
+            echo "No previous backup found. A fresh world will be generated."
+          fi
+
+      - name: Keep Runner Alive (Soft Timeout)
+        # Forces this step to fail after 350 minutes, triggering the backup step
+        timeout-minutes: 350
+        run: |
+          echo "=========================================================="
+          echo "Server prepped! Connect via: tailscale ssh runner@gh-runner-ci"
+          echo "Start server with: cd ~/minecraft && docker compose up -d"
+          echo "=========================================================="
+          sleep infinity
+
+      - name: Auto-Backup World Before Shutdown
+        # The always() condition guarantees this runs even when the timeout kills the sleep command
+        if: always()
+        run: |
+          echo "Initiating emergency backup..."
+          if [ -f /home/runner/repo-backup.sh ]; then
+            /home/runner/repo-backup.sh
+          else
+            echo "Backup script not found!"
+          fi
