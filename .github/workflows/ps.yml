@@ -17,9 +17,9 @@ jobs:
           hostname: gh-runner-ci
           args: --ssh --advertise-tags=tag:ci --accept-risk=lose-ssh
 
-      # - name: Start Docker Container
-      #   run: |
-      #     docker run -d --name debug-container ubuntu:latest sleep infinity
+      - name: Start Docker Container
+        run: |
+          docker run -d --name debug-container ubuntu:latest sleep infinity
 
       - name: Keep Runner Alive
         run: |
