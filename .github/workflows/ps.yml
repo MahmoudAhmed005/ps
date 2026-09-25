@@ -56,6 +56,7 @@ jobs:
           export BACKUP_PAT="${{ secrets.BACKUP_PAT }}"
           export GH_USERNAME="${{ secrets.GH_USERNAME }}"
           export BACKUP_REPO="${{ secrets.BACKUP_REPO }}"
+          export ENCRYPTION_PASS="${{ secrets.ENCRYPTION_PASS }}"
           EOF
           chmod 600 /home/runner/.mc_env
 
@@ -64,10 +65,9 @@ jobs:
           #!/bin/bash
           set -e
 
-          # Source credentials if not already exported in the shell
           [ -f /home/runner/.mc_env ] && source /home/runner/.mc_env
           
-          # Strip accidental spaces or newlines from secrets
+          # Strip accidental spaces from Git secrets (Don't strip pass to allow spaces in passwords)
           BACKUP_PAT=$(echo "${BACKUP_PAT}" | tr -d '[:space:]')
           GH_USERNAME=$(echo "${GH_USERNAME}" | tr -d '[:space:]')
           BACKUP_REPO=$(echo "${BACKUP_REPO}" | tr -d '[:space:]')
@@ -84,65 +84,69 @@ jobs:
           echo "Flushing container memory..."
           docker stop mc-server || true
 
-          mkdir -p /tmp/mc-backup
-          cd /tmp/mc-backup
+          # Create isolated directories for our two strategies
+          mkdir -p /tmp/mc-core /tmp/mc-git /tmp/mc-artifact
 
           echo "Compressing world..."
-          sudo tar -czf world.tar.gz -C /home/runner/minecraft/data world/
-          sudo chown runner:runner world.tar.gz
+          sudo tar -czf /tmp/mc-core/world.tar.gz -C /home/runner/minecraft/data world/
+          sudo chown runner:runner /tmp/mc-core/world.tar.gz
 
-          echo "Pushing archive to private backup repository..."
-          rm -rf .git
+          # ==========================================
+          # STRATEGY 1: Split and Push to Private Git
+          # ==========================================
+          echo "Chunking archive into 90MB parts for Git..."
+          split -b 90M /tmp/mc-core/world.tar.gz /tmp/mc-git/world.part.
+
+          echo "Pushing chunks to private GitHub repository..."
+          cd /tmp/mc-git
           git init
-          git config --global --add safe.directory /tmp/mc-backup
-          
-          # Setup dummy user for the commit
+          git config --global --add safe.directory /tmp/mc-git
           git config user.email "runner@github.actions"
           git config user.name "GitHub Runner"
           git branch -M main
 
-          # Safely configure authentication without putting the token in the URL
           git config credential.helper "!f() { echo \"username=oauth2\"; echo \"password=${BACKUP_PAT}\"; }; f"
           git remote add origin "https://github.com/${GH_USERNAME}/${BACKUP_REPO}.git"
 
-          git add world.tar.gz
+          git add world.part.*
           git commit -m "Backup: $(date -u)"
-
-          # Push quietly to prevent Git from logging progress output or errors
           git push -f origin main
-          
-          echo "Backup pushed successfully!"
+          echo "Git push complete!"
+
+          # ==========================================
+          # STRATEGY 2: Encrypt for Public Artifact
+          # ==========================================
+          echo "Encrypting world archive for public Artifact..."
+          # Uses AES-256-CBC with a salt, deriving the key securely via PBKDF2
+          openssl enc -aes-256-cbc -salt -pbkdf2 -in /tmp/mc-core/world.tar.gz -out /tmp/mc-artifact/world.tar.gz.enc -pass pass:"${ENCRYPTION_PASS}"
+          echo "Encryption complete! Artifact is ready."
           EOF
 
           chmod +x /home/runner/repo-backup.sh
 
-      - name: Restore Previous World
+      - name: Restore Previous World (From Private Git)
         run: |
           echo "Cloning private backup repository securely..."
           
-          # Strip accidental spaces or newlines from secrets directly in YAML
           CLEAN_PAT=$(echo "${{ secrets.BACKUP_PAT }}" | tr -d '[:space:]')
           CLEAN_USER=$(echo "${{ secrets.GH_USERNAME }}" | tr -d '[:space:]')
           CLEAN_REPO=$(echo "${{ secrets.BACKUP_REPO }}" | tr -d '[:space:]')
           
-          # Temporarily inject the auth helper just for the clone process
           git config --global credential.helper "!f() { echo \"username=oauth2\"; echo \"password=${CLEAN_PAT}\"; }; f"
-          
-          # Clone quietly to avoid any repository metadata leaking to logs
           git clone --quiet "https://github.com/${CLEAN_USER}/${CLEAN_REPO}.git" /tmp/backup-repo || true
-          
-          # Remove the global credential helper immediately after cloning
           git config --global --unset credential.helper
 
-          if [ -f /tmp/backup-repo/world.tar.gz ]; then
+          if [ -f /tmp/backup-repo/world.part.aa ]; then
+            echo "Reassembling 90MB chunks..."
+            cat /tmp/backup-repo/world.part.* > /tmp/backup-repo/world.tar.gz
+            
             echo "Extracting world data..."
             mkdir -p /home/runner/minecraft/data
             sudo tar -xzf /tmp/backup-repo/world.tar.gz -C /home/runner/minecraft/data
-            # Grant full read/write permissions so Docker UID 1000 can freely access the restored world
             sudo chmod -R 777 /home/runner/minecraft/data
-            echo "World restored successfully!"
+            echo "World restored seamlessly from chunks!"
           else
-            echo "No existing backup found. A fresh world will be generated on boot."
+            echo "No existing backup chunks found. A fresh world will be generated on boot."
           fi
 
       - name: Keep Runner Alive (Soft Timeout)
@@ -156,7 +160,7 @@ jobs:
           echo "=========================================================="
           sleep infinity
 
-      - name: Auto-Backup World Before Shutdown
+      - name: Execute Backup Script
         if: always()
         run: |
           echo "Triggering automated backup sequence..."
@@ -165,3 +169,13 @@ jobs:
           else
             echo "Backup script not found!"
           fi
+
+      - name: Upload Encrypted World as Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: encrypted-minecraft-world
+          path: /tmp/mc-artifact/world.tar.gz.enc
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: ignore
