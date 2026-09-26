@@ -10,13 +10,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # --- Setup Tailscale SSH with Full Terminal Support ---
+      # --- Setup Tailscale SSH using Auth Key ---
       - name: Connect Tailscale
         uses: tailscale/github-action@v2
         with:
-          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
-          tags: tag:ci
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
           args: --ssh
 
       - name: Configure Interactive Bash Environment
@@ -25,11 +23,14 @@ jobs:
           sudo chsh -s /bin/bash runner || true
           sudo chsh -s /bin/bash root || true
 
-          # Configure terminal variables for interactive sessions
-          cat << 'EOF' | sudo tee -a /etc/profile.d/interactive_term.sh
+          # Inject terminal configurations for login and non-login shells
+          cat << 'EOF' | sudo tee /etc/profile.d/interactive_term.sh
           export TERM=xterm-256color
           export SHELL=/bin/bash
           EOF
+
+          # Ensure .bashrc exports TERM as well for non-login interactive SSH sessions
+          echo 'export TERM=xterm-256color' | sudo tee -a /home/runner/.bashrc /root/.bashrc
 
       # --- Backup Target Directories ---
       - name: Create Backup Archive
@@ -55,7 +56,6 @@ jobs:
           if [ ${#EXISTING_TARGETS[@]} -gt 0 ]; then
             echo "Backing up: ${EXISTING_TARGETS[*]}"
             tar -czf "$ARCHIVE_FILE" "${EXISTING_TARGETS[@]}"
-            echo "BACKUP_PATH=$ARCHIVE_FILE" >> $GITHUB_ENV
           else
             echo "No specified directories found to back up."
           fi
@@ -68,7 +68,7 @@ jobs:
           path: /home/runner/backups/*.tar.gz
           if-no-files-found: warn
 
-      # --- Keep Workflow Alive for Tailscale Access ---
+      # --- Keep Runner Alive for Remote Access ---
       - name: Keep Runner Alive
         run: |
           echo "Tailscale SSH is ready. Connect via: tailscale ssh runner@<node-name>"
