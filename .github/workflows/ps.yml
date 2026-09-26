@@ -1,23 +1,31 @@
-name: Minecraft Server CI & Remote Access
+name: Ephemeral Minecraft Server
 
 on:
   workflow_dispatch:
 
 jobs:
-  run-server:
+  minecraft-session:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
+      - name: Checkout Code
         uses: actions/checkout@v4
 
-      # --- 1. Tailscale Setup ---
-      - name: Connect Tailscale
-        uses: tailscale/github-action@v2
+      # --- 1. Tailscale Connection ---
+      - name: Connect Runner to Tailscale
+        uses: tailscale/github-action@v3
         with:
           authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
-          args: --ssh
+          hostname: gh-runner-ci
+          args: --ssh --advertise-tags=tag:ci --accept-risk=lose-ssh --accept-dns
 
-      # --- 2. Shell Environment Setup ---
+      - name: Force Strict Tailscale DNS
+        run: |
+          sudo unlink /etc/resolv.conf
+          echo "nameserver 100.100.100.100" | sudo tee /etc/resolv.conf
+          echo "options edns0 trust-ad" | sudo tee -a /etc/resolv.conf
+          sudo chattr +i /etc/resolv.conf
+
+      # --- 2. Interactive Terminal Setup ---
       - name: Configure Interactive Bash Environment
         run: |
           sudo chsh -s /bin/bash runner || true
@@ -30,20 +38,52 @@ jobs:
 
           echo 'export TERM=xterm-256color' | sudo tee -a /home/runner/.bashrc /root/.bashrc
 
-      # --- 3. Keep Runner Alive for SSH Sessions ---
-      - name: Keep Runner Alive
+      # --- 3. Docker Compose Setup ---
+      - name: Generate Docker Compose
         run: |
-          echo "Tailscale SSH is active. Connect via: tailscale ssh runner@<node-name>"
-          # Keeps runner up for up to 6 hours (or until you kill this process / cancel the job)
-          sleep 6h
+          mkdir -p /home/runner/minecraft
+          cat << 'EOF' > /home/runner/minecraft/docker-compose.yml
+          services:
+            mc:
+              image: itzg/minecraft-server
+              container_name: mc-server
+              ports:
+                - "25565:25565"
+              environment:
+                EULA: "TRUE"
+                TYPE: "NEOFORGE"
+                VERSION: "1.21.1"
+                ONLINE_MODE: "FALSE"
+                MEMORY: "8G"
+                MAX_TICK_TIME: "-1"
+                JVM_OPTS: "-XX:+UseG1GC -XX:+ParallelRefProcEnabled -XX:MaxGCPauseMillis=200 -XX:+UnlockExperimentalVMOptions -XX:+DisableExplicitGC -XX:+AlwaysPreTouch -XX:G1NewSizePercent=30 -XX:G1MaxNewSizePercent=40 -XX:G1HeapRegionSize=8M -XX:G1ReservePercent=20 -XX:G1HeapWastePercent=5 -XX:G1MixedGCCountTarget=4 -Dfml.readTimeout=180"
+              volumes:
+                - ./data:/data
+              restart: unless-stopped
+              tty: true
+              stdin_open: true
+          EOF
 
-      # --- 4. Backup Steps (Only execute when session finishes, times out, or cancels) ---
-      - name: Create Backup Archive
-        if: always()
+      # --- 4. Generate Backup Script & Secrets ---
+      - name: Generate Backup Script and Secrets Env
         run: |
-          mkdir -p /home/runner/backups
-          TIMESTAMP=$(date +'%Y%m%d_%H%M%S')
-          ARCHIVE_FILE="/home/runner/backups/server_backup_${TIMESTAMP}.tar.gz"
+          cat << EOF > /home/runner/.mc_env
+          export BACKUP_PAT="${{ secrets.BACKUP_PAT }}"
+          export GH_USERNAME="${{ secrets.GH_USERNAME }}"
+          export BACKUP_REPO="${{ secrets.BACKUP_REPO }}"
+          export ENCRYPTION_PASS="${{ secrets.ENCRYPTION_PASS }}"
+          EOF
+          chmod 600 /home/runner/.mc_env
+
+          cat << 'EOF' > /home/runner/repo-backup.sh
+          #!/bin/bash
+          set -e
+
+          [ -f /home/runner/.mc_env ] && source /home/runner/.mc_env
+
+          BACKUP_PAT=$(echo "${BACKUP_PAT}" | tr -d '[:space:]')
+          GH_USERNAME=$(echo "${GH_USERNAME}" | tr -d '[:space:]')
+          BACKUP_REPO=$(echo "${BACKUP_REPO}" | tr -d '[:space:]')
 
           TARGETS=(
             "/home/runner/minecraft/data/world"
@@ -52,23 +92,123 @@ jobs:
           )
 
           EXISTING_TARGETS=()
-          for item in "${TARGETS[@]}"; do
-            if [ -e "$item" ]; then
-              EXISTING_TARGETS+=("$item")
+          for target in "${TARGETS[@]}"; do
+            if [ -e "$target" ]; then
+              EXISTING_TARGETS+=("$target")
             fi
           done
 
-          if [ ${#EXISTING_TARGETS[@]} -gt 0 ]; then
-            echo "Archiving: ${EXISTING_TARGETS[*]}"
-            tar -czf "$ARCHIVE_FILE" "${EXISTING_TARGETS[@]}"
-          else
-            echo "No targets found to back up."
+          if [ ${#EXISTING_TARGETS[@]} -eq 0 ]; then
+            echo "No target directories found to back up. Skipping."
+            exit 0
           fi
 
-      - name: Upload Backup Artifact
+          echo "Flushing container memory..."
+          docker exec mc-server rcon-cli save-all || true
+          sleep 2
+          docker stop mc-server || true
+
+          mkdir -p /tmp/mc-core /tmp/mc-git /tmp/mc-artifact
+
+          echo "Compressing targets: ${EXISTING_TARGETS[*]}..."
+          sudo tar -czPf /tmp/mc-core/backup.tar.gz "${EXISTING_TARGETS[@]}"
+          sudo chown runner:runner /tmp/mc-core/backup.tar.gz
+
+          # STRATEGY 1: Split and Push Chunks to Private Repo
+          echo "Chunking archive into 90MB parts for Git..."
+          split -b 90M /tmp/mc-core/backup.tar.gz /tmp/mc-git/backup.part.
+
+          echo "Pushing chunks to private GitHub repository..."
+          cd /tmp/mc-git
+          git init
+          git config --global --add safe.directory /tmp/mc-git
+          git config user.email "runner@github.actions"
+          git config user.name "GitHub Runner"
+          git branch -M main
+
+          git config credential.helper "!f() { echo \"username=oauth2\"; echo \"password=${BACKUP_PAT}\"; }; f"
+          git remote add origin "https://github.com/${GH_USERNAME}/${BACKUP_REPO}.git"
+
+          git add backup.part.*
+          git commit -m "Backup: $(date -u)"
+          git push -f origin main
+          echo "Git push complete!"
+
+          # STRATEGY 2: Encrypt for Public Artifact
+          if [ -n "${ENCRYPTION_PASS}" ]; then
+            echo "Encrypting backup archive for public Artifact..."
+            openssl enc -aes-256-cbc -salt -pbkdf2 -in /tmp/mc-core/backup.tar.gz -out /tmp/mc-artifact/backup.tar.gz.enc -pass pass:"${ENCRYPTION_PASS}"
+            echo "Encryption complete! Artifact is ready."
+          fi
+          EOF
+
+          chmod +x /home/runner/repo-backup.sh
+
+      # --- 5. Restore All Targets from Private Git ---
+      - name: Restore Previous State (World, Mods, Work)
+        run: |
+          echo "Preparing target directories..."
+          sudo mkdir -p /home/runner/minecraft/data/world
+          sudo mkdir -p /home/runner/minecraft/data/mods
+          sudo mkdir -p /home/runner/work
+
+          CLEAN_PAT=$(echo "${{ secrets.BACKUP_PAT }}" | tr -d '[:space:]')
+          CLEAN_USER=$(echo "${{ secrets.GH_USERNAME }}" | tr -d '[:space:]')
+          CLEAN_REPO=$(echo "${{ secrets.BACKUP_REPO }}" | tr -d '[:space:]')
+
+          git config --global credential.helper "!f() { echo \"username=oauth2\"; echo \"password=${CLEAN_PAT}\"; }; f"
+          git clone --quiet "https://github.com/${CLEAN_USER}/${CLEAN_REPO}.git" /tmp/backup-repo || true
+          git config --global --unset credential.helper
+
+          # Handle new chunk naming scheme (backup.part.*) and fallback to legacy (world.part.*)
+          if [ -f /tmp/backup-repo/backup.part.aa ]; then
+            echo "Reassembling backup chunks..."
+            cat /tmp/backup-repo/backup.part.* > /tmp/backup-repo/backup.tar.gz
+            echo "Extracting backup to original system paths..."
+            sudo tar -xzPf /tmp/backup-repo/backup.tar.gz
+            sudo chown -R runner:runner /home/runner/minecraft /home/runner/work
+            sudo chmod -R 777 /home/runner/minecraft/data
+            echo "Restoration complete."
+          elif [ -f /tmp/backup-repo/world.part.aa ]; then
+            echo "Found legacy world chunks. Reassembling..."
+            cat /tmp/backup-repo/world.part.* > /tmp/backup-repo/world.tar.gz
+            sudo tar -xzf /tmp/backup-repo/world.tar.gz -C /home/runner/minecraft/data
+            sudo chown -R runner:runner /home/runner/minecraft
+            sudo chmod -R 777 /home/runner/minecraft/data
+            echo "Legacy world restored."
+          else
+            echo "No existing backup chunks found. Starting fresh."
+          fi
+
+      # --- 6. Keep Alive ---
+      - name: Keep Runner Alive (Soft Timeout)
+        timeout-minutes: 350
+        run: |
+          echo "=========================================================="
+          echo "Runner is live on Tailnet!"
+          echo "Connect via: tailscale ssh runner@gh-runner-ci"
+          echo "Start server: cd ~/minecraft && docker compose up -d"
+          echo "Manual backup: ~/repo-backup.sh"
+          echo "=========================================================="
+          sleep infinity
+
+      # --- 7. Execution on Termination / Cancellation ---
+      - name: Execute Backup Script
+        if: always()
+        run: |
+          echo "Triggering automated backup sequence..."
+          if [ -f /home/runner/repo-backup.sh ]; then
+            /home/runner/repo-backup.sh
+          else
+            echo "Backup script not found!"
+          fi
+
+      - name: Upload Encrypted State as Artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: minecraft-server-backup
-          path: /home/runner/backups/*.tar.gz
-          if-no-files-found: warn
+          name: encrypted-minecraft-backup
+          path: /tmp/mc-artifact/backup.tar.gz.enc
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: ignore
