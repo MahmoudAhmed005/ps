@@ -10,29 +10,34 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # --- Setup Tailscale SSH using Auth Key ---
+      # --- 1. Tailscale Setup ---
       - name: Connect Tailscale
         uses: tailscale/github-action@v2
         with:
           authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
           args: --ssh
 
+      # --- 2. Shell Environment Setup ---
       - name: Configure Interactive Bash Environment
         run: |
-          # Set default shell to bash for runner and root
           sudo chsh -s /bin/bash runner || true
           sudo chsh -s /bin/bash root || true
 
-          # Inject terminal configurations for login and non-login shells
           cat << 'EOF' | sudo tee /etc/profile.d/interactive_term.sh
           export TERM=xterm-256color
           export SHELL=/bin/bash
           EOF
 
-          # Ensure .bashrc exports TERM as well for non-login interactive SSH sessions
           echo 'export TERM=xterm-256color' | sudo tee -a /home/runner/.bashrc /root/.bashrc
 
-      # --- Backup Target Directories ---
+      # --- 3. Keep Runner Alive for SSH Sessions ---
+      - name: Keep Runner Alive
+        run: |
+          echo "Tailscale SSH is active. Connect via: tailscale ssh runner@<node-name>"
+          # Keeps runner up for up to 6 hours (or until you kill this process / cancel the job)
+          sleep 6h
+
+      # --- 4. Backup Steps (Only execute when session finishes, times out, or cancels) ---
       - name: Create Backup Archive
         if: always()
         run: |
@@ -54,10 +59,10 @@ jobs:
           done
 
           if [ ${#EXISTING_TARGETS[@]} -gt 0 ]; then
-            echo "Backing up: ${EXISTING_TARGETS[*]}"
+            echo "Archiving: ${EXISTING_TARGETS[*]}"
             tar -czf "$ARCHIVE_FILE" "${EXISTING_TARGETS[@]}"
           else
-            echo "No specified directories found to back up."
+            echo "No targets found to back up."
           fi
 
       - name: Upload Backup Artifact
@@ -67,9 +72,3 @@ jobs:
           name: minecraft-server-backup
           path: /home/runner/backups/*.tar.gz
           if-no-files-found: warn
-
-      # --- Keep Runner Alive for Remote Access ---
-      - name: Keep Runner Alive
-        run: |
-          echo "Tailscale SSH is ready. Connect via: tailscale ssh runner@<node-name>"
-          sleep 6h
