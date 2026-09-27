@@ -71,7 +71,6 @@ jobs:
           export BACKUP_PAT="${{ secrets.BACKUP_PAT }}"
           export GH_USERNAME="${{ secrets.GH_USERNAME }}"
           export BACKUP_REPO="${{ secrets.BACKUP_REPO }}"
-          export ENCRYPTION_PASS="${{ secrets.ENCRYPTION_PASS }}"
           EOF
           chmod 600 /home/runner/.mc_env
 
@@ -103,12 +102,16 @@ jobs:
             exit 0
           fi
 
-          echo "Flushing container memory..."
-          docker exec mc-server rcon-cli save-all || true
-          sleep 2
-          docker stop mc-server || true
+          if docker ps -q -f name=mc-server | grep -q .; then
+            echo "Flushing container memory..."
+            docker exec mc-server rcon-cli save-all || true
+            sleep 2
+            docker stop mc-server || true
+          else
+            echo "Container mc-server is not running. Skipping save-all."
+          fi
 
-          mkdir -p /tmp/mc-core /tmp/mc-git /tmp/mc-artifact
+          mkdir -p /tmp/mc-core /tmp/mc-git
 
           echo "Compressing targets: ${EXISTING_TARGETS[*]}..."
           sudo tar -czPf /tmp/mc-core/backup.tar.gz "${EXISTING_TARGETS[@]}"
@@ -118,7 +121,7 @@ jobs:
           echo "Chunking archive into 90MB parts for Git..."
           split -b 90M /tmp/mc-core/backup.tar.gz /tmp/mc-git/backup.part.
 
-          echo "Pushing chunks to private GitHub repository..."
+          echo "Pushing chunks iteratively to private GitHub repository..."
           cd /tmp/mc-git
           git init
           git config --global --add safe.directory /tmp/mc-git
@@ -129,17 +132,23 @@ jobs:
           git config credential.helper "!f() { echo \"username=oauth2\"; echo \"password=${BACKUP_PAT}\"; }; f"
           git remote add origin "https://github.com/${GH_USERNAME}/${BACKUP_REPO}.git"
 
-          git add backup.part.*
-          git commit -m "Backup: $(date -u)"
-          git push -f origin main
-          echo "Git push complete!"
+          FIRST_PUSH=true
+          for chunk in backup.part.*; do
+            echo "Committing $chunk..."
+            git add "$chunk"
+            git commit -m "Backup chunk: $chunk"
+            
+            if [ "$FIRST_PUSH" = true ]; then
+              echo "Force pushing first chunk to reset remote..."
+              git push -f origin main
+              FIRST_PUSH=false
+            else
+              echo "Pushing subsequent chunk..."
+              git push origin main
+            fi
+          done
 
-          # STRATEGY 2: Encrypt for Public Artifact
-          if [ -n "${ENCRYPTION_PASS}" ]; then
-            echo "Encrypting backup archive for public Artifact..."
-            openssl enc -aes-256-cbc -salt -pbkdf2 -in /tmp/mc-core/backup.tar.gz -out /tmp/mc-artifact/backup.tar.gz.enc -pass pass:"${ENCRYPTION_PASS}"
-            echo "Encryption complete! Artifact is ready."
-          fi
+          echo "Git push complete!"
           EOF
 
           chmod +x /home/runner/repo-backup.sh
@@ -160,7 +169,6 @@ jobs:
           git clone --quiet "https://github.com/${CLEAN_USER}/${CLEAN_REPO}.git" /tmp/backup-repo || true
           git config --global --unset credential.helper
 
-          # Handle new chunk naming scheme (backup.part.*) and fallback to legacy (world.part.*)
           if [ -f /tmp/backup-repo/backup.part.aa ]; then
             echo "Reassembling backup chunks..."
             cat /tmp/backup-repo/backup.part.* > /tmp/backup-repo/backup.tar.gz
@@ -203,12 +211,16 @@ jobs:
             echo "Backup script not found!"
           fi
 
-      - name: Upload Encrypted State as Artifact
+      # Directly upload the directories as a standard Zip file via Artifacts
+      - name: Upload Minecraft Directories as Artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: encrypted-minecraft-backup
-          path: /tmp/mc-artifact/backup.tar.gz.enc
-          compression-level: 0
+          name: minecraft-backup-data
+          path: |
+            /home/runner/minecraft/data/world
+            /home/runner/minecraft/data/mods
+            /home/runner/work
+          compression-level: 6
           retention-days: 7
           if-no-files-found: ignore
