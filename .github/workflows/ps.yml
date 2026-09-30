@@ -38,6 +38,7 @@ jobs:
         with:
           authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
           tags: tag:ci
+          args: --ssh
 
       # 3. KEEP ALIVE
       - name: Keep Alive (Running)
