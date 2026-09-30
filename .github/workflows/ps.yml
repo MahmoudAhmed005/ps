@@ -1,226 +1,84 @@
-name: Ephemeral Minecraft Server
+name: Cloud  Pipeline
 
 on:
   workflow_dispatch:
 
 jobs:
-  minecraft-session:
+  compressor_node:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+      # 1. ONE RESTORE STEP: Clone, merge, decrypt, and extract
+      - name: Restore Encrypted Backup
+        env:
+          GH_TOKEN: ${{ secrets.BACKUP_PAT }}
+          GH_USER: ${{ secrets.GH_USERNAME }}
+          REPO_NAME: ${{ secrets.BACKUP_REPO }}
+          ENC_PASS: ${{ secrets.ENCRYPTION_PASS }}
+        run: |
+          cd /home/runner/work
+          # Clone the backup repo using your PAT and Username
+          git clone https://${GH_USER}:${GH_TOKEN}@github.com/${GH_USER}/${REPO_NAME}.git backup-repo || true
+          
+          # Check for chunks, combine, decrypt, and extract
+          if ls backup-repo/chunks/backup_part_* 1> /dev/null 2>&1; then
+            echo "Recombining chunks..."
+            cat backup-repo/chunks/backup_part_* > backup.tar.gz.enc
+            
+            echo "Decrypting and restoring files..."
+            openssl enc -aes-256-cbc -d -pbkdf2 -pass pass:"$ENC_PASS" -in backup.tar.gz.enc | tar -xzf -
+            echo "Backup restored successfully!"
+          else
+            echo "No chunks found, creating fresh storage folders."
+            mkdir -p storage/raw storage/compressed
+          fi
 
-      # --- 1. Tailscale Connection ---
-      - name: Connect Runner to Tailscale
-        uses: tailscale/github-action@v3
+      # 2. RUN TAILSCALE
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v2
         with:
           authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
-          hostname: gh-runner-ci
-          args: --ssh --advertise-tags=tag:ci --accept-risk=lose-ssh --accept-dns
+          tags: tag:ci
 
-      - name: Force Strict Tailscale DNS
+      # 3. KEEP ALIVE
+      - name: Keep Alive (Running)
         run: |
-          sudo unlink /etc/resolv.conf
-          echo "nameserver 100.100.100.100" | sudo tee /etc/resolv.conf
-          echo "options edns0 trust-ad" | sudo tee -a /etc/resolv.conf
-          sudo chattr +i /etc/resolv.conf
+          echo "☁️ The Cloud Compressor is now online."
+          echo "Click 'Cancel Run' to trigger the secure backup and shutdown."
+          sleep 20700
 
-      # --- 2. Interactive Terminal Setup ---
-      - name: Configure Interactive Bash Environment
-        run: |
-          sudo chsh -s /bin/bash runner || true
-          sudo chsh -s /bin/bash root || true
-
-          cat << 'EOF' | sudo tee /etc/profile.d/interactive_term.sh
-          export TERM=xterm-256color
-          export SHELL=/bin/bash
-          EOF
-
-          echo 'export TERM=xterm-256color' | sudo tee -a /home/runner/.bashrc /root/.bashrc
-
-      # --- 3. Docker Compose Setup ---
-      - name: Generate Docker Compose
-        run: |
-          mkdir -p /home/runner/minecraft
-          cat << 'EOF' > /home/runner/minecraft/docker-compose.yml
-          services:
-            mc:
-              image: itzg/minecraft-server
-              container_name: mc-server
-              ports:
-                - "25565:25565"
-              environment:
-                EULA: "TRUE"
-                TYPE: "NEOFORGE"
-                VERSION: "1.21.1"
-                ONLINE_MODE: "FALSE"
-                MEMORY: "8G"
-                MAX_TICK_TIME: "-1"
-                JVM_OPTS: "-XX:+UseG1GC -XX:+ParallelRefProcEnabled -XX:MaxGCPauseMillis=200 -XX:+UnlockExperimentalVMOptions -XX:+DisableExplicitGC -XX:+AlwaysPreTouch -XX:G1NewSizePercent=30 -XX:G1MaxNewSizePercent=40 -XX:G1HeapRegionSize=8M -XX:G1ReservePercent=20 -XX:G1HeapWastePercent=5 -XX:G1MixedGCCountTarget=4 -Dfml.readTimeout=180"
-              volumes:
-                - ./data:/data
-              restart: unless-stopped
-              tty: true
-              stdin_open: true
-          EOF
-
-      # --- 4. Generate Backup Script & Secrets ---
-      - name: Generate Backup Script and Secrets Env
-        run: |
-          cat << EOF > /home/runner/.mc_env
-          export BACKUP_PAT="${{ secrets.BACKUP_PAT }}"
-          export GH_USERNAME="${{ secrets.GH_USERNAME }}"
-          export BACKUP_REPO="${{ secrets.BACKUP_REPO }}"
-          EOF
-          chmod 600 /home/runner/.mc_env
-
-          cat << 'EOF' > /home/runner/repo-backup.sh
-          #!/bin/bash
-          set -e
-
-          [ -f /home/runner/.mc_env ] && source /home/runner/.mc_env
-
-          BACKUP_PAT=$(echo "${BACKUP_PAT}" | tr -d '[:space:]')
-          GH_USERNAME=$(echo "${GH_USERNAME}" | tr -d '[:space:]')
-          BACKUP_REPO=$(echo "${BACKUP_REPO}" | tr -d '[:space:]')
-
-          TARGETS=(
-            "/home/runner/minecraft/data/world"
-            "/home/runner/minecraft/data/mods"
-            "/home/runner/work"
-          )
-
-          EXISTING_TARGETS=()
-          for target in "${TARGETS[@]}"; do
-            if [ -e "$target" ]; then
-              EXISTING_TARGETS+=("$target")
-            fi
-          done
-
-          if [ ${#EXISTING_TARGETS[@]} -eq 0 ]; then
-            echo "No target directories found to back up. Skipping."
-            exit 0
-          fi
-
-          if docker ps -q -f name=mc-server | grep -q .; then
-            echo "Flushing container memory..."
-            docker exec mc-server rcon-cli save-all || true
-            sleep 2
-            docker stop mc-server || true
-          else
-            echo "Container mc-server is not running. Skipping save-all."
-          fi
-
-          mkdir -p /tmp/mc-core /tmp/mc-git
-
-          echo "Compressing targets: ${EXISTING_TARGETS[*]}..."
-          sudo tar -czPf /tmp/mc-core/backup.tar.gz "${EXISTING_TARGETS[@]}"
-          sudo chown runner:runner /tmp/mc-core/backup.tar.gz
-
-          # STRATEGY 1: Split and Push Chunks to Private Repo
-          echo "Chunking archive into 90MB parts for Git..."
-          split -b 90M /tmp/mc-core/backup.tar.gz /tmp/mc-git/backup.part.
-
-          echo "Pushing chunks iteratively to private GitHub repository..."
-          cd /tmp/mc-git
-          git init
-          git config --global --add safe.directory /tmp/mc-git
-          git config user.email "runner@github.actions"
-          git config user.name "GitHub Runner"
-          git branch -M main
-
-          git config credential.helper "!f() { echo \"username=oauth2\"; echo \"password=${BACKUP_PAT}\"; }; f"
-          git remote add origin "https://github.com/${GH_USERNAME}/${BACKUP_REPO}.git"
-
-          FIRST_PUSH=true
-          for chunk in backup.part.*; do
-            echo "Committing $chunk..."
-            git add "$chunk"
-            git commit -m "Backup chunk: $chunk"
-            
-            if [ "$FIRST_PUSH" = true ]; then
-              echo "Force pushing first chunk to reset remote..."
-              git push -f origin main
-              FIRST_PUSH=false
-            else
-              echo "Pushing subsequent chunk..."
-              git push origin main
-            fi
-          done
-
-          echo "Git push complete!"
-          EOF
-
-          chmod +x /home/runner/repo-backup.sh
-
-      # --- 5. Restore All Targets from Private Git ---
-      - name: Restore Previous State (World, Mods, Work)
-        run: |
-          echo "Preparing target directories..."
-          sudo mkdir -p /home/runner/minecraft/data/world
-          sudo mkdir -p /home/runner/minecraft/data/mods
-          sudo mkdir -p /home/runner/work
-
-          CLEAN_PAT=$(echo "${{ secrets.BACKUP_PAT }}" | tr -d '[:space:]')
-          CLEAN_USER=$(echo "${{ secrets.GH_USERNAME }}" | tr -d '[:space:]')
-          CLEAN_REPO=$(echo "${{ secrets.BACKUP_REPO }}" | tr -d '[:space:]')
-
-          git config --global credential.helper "!f() { echo \"username=oauth2\"; echo \"password=${CLEAN_PAT}\"; }; f"
-          git clone --quiet "https://github.com/${CLEAN_USER}/${CLEAN_REPO}.git" /tmp/backup-repo || true
-          git config --global --unset credential.helper
-
-          if [ -f /tmp/backup-repo/backup.part.aa ]; then
-            echo "Reassembling backup chunks..."
-            cat /tmp/backup-repo/backup.part.* > /tmp/backup-repo/backup.tar.gz
-            echo "Extracting backup to original system paths..."
-            sudo tar -xzPf /tmp/backup-repo/backup.tar.gz
-            sudo chown -R runner:runner /home/runner/minecraft /home/runner/work
-            sudo chmod -R 777 /home/runner/minecraft/data
-            echo "Restoration complete."
-          elif [ -f /tmp/backup-repo/world.part.aa ]; then
-            echo "Found legacy world chunks. Reassembling..."
-            cat /tmp/backup-repo/world.part.* > /tmp/backup-repo/world.tar.gz
-            sudo tar -xzf /tmp/backup-repo/world.tar.gz -C /home/runner/minecraft/data
-            sudo chown -R runner:runner /home/runner/minecraft
-            sudo chmod -R 777 /home/runner/minecraft/data
-            echo "Legacy world restored."
-          else
-            echo "No existing backup chunks found. Starting fresh."
-          fi
-
-      # --- 6. Keep Alive ---
-      - name: Keep Runner Alive (Soft Timeout)
-        timeout-minutes: 350
-        run: |
-          echo "=========================================================="
-          echo "Runner is live on Tailnet!"
-          echo "Connect via: tailscale ssh runner@gh-runner-ci"
-          echo "Start server: cd ~/minecraft && docker compose up -d"
-          echo "Manual backup: ~/repo-backup.sh"
-          echo "=========================================================="
-          sleep infinity
-
-      # --- 7. Execution on Termination / Cancellation ---
-      - name: Execute Backup Script
+      # 4. ONE BACKUP STEP: Compress & Encrypt (on the fly), split, and force-push
+      - name: Encrypt Backup & Push to Repo
         if: always()
+        env:
+          GH_TOKEN: ${{ secrets.BACKUP_PAT }}
+          GH_USER: ${{ secrets.GH_USERNAME }}
+          REPO_NAME: ${{ secrets.BACKUP_REPO }}
+          ENC_PASS: ${{ secrets.ENCRYPTION_PASS }}
         run: |
-          echo "Triggering automated backup sequence..."
-          if [ -f /home/runner/repo-backup.sh ]; then
-            /home/runner/repo-backup.sh
-          else
-            echo "Backup script not found!"
-          fi
+          cd /home/runner/work
+          echo "Compressing and encrypting storage on the fly..."
+          tar -czf - storage/ | openssl enc -aes-256-cbc -pbkdf2 -salt -pass pass:"$ENC_PASS" -out backup.tar.gz.enc
+          
+          echo "Splitting encrypted file into 50MB chunks..."
+          mkdir -p backup-repo/chunks
+          rm -f backup-repo/chunks/backup_part_*
+          split -b 50M backup.tar.gz.enc backup-repo/chunks/backup_part_
+          
+          echo "Force-pushing encrypted chunks to GitHub..."
+          cd backup-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout --orphan temp-branch
+          git add chunks/
+          git commit -m "Automated Encrypted Backup [skip ci]"
+          git branch -M main
+          git push -f https://${GH_USER}:${GH_TOKEN}@github.com/${GH_USER}/${REPO_NAME}.git main
 
-      # Directly upload the directories as a standard Zip file via Artifacts
-      - name: Upload Minecraft Directories as Artifact
+      # 5. UPLOAD SECURE ARTIFACT (Fallback)
+      - name: Upload Encrypted Artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: minecraft-backup-data
-          path: |
-            /home/runner/minecraft/data/world
-            /home/runner/minecraft/data/mods
-            /home/runner/work
-          compression-level: 6
-          retention-days: 7
-          if-no-files-found: ignore
+          name: storage-backup-encrypted
+          path: /home/runner/work/backup.tar.gz.enc
+          retention-days: 5
