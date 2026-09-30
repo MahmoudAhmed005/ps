@@ -1,4 +1,4 @@
-name: Cloud  Pipeline
+name: Cloud Pipeline
 
 on:
   workflow_dispatch:
@@ -16,23 +16,19 @@ jobs:
           ENC_PASS: ${{ secrets.ENCRYPTION_PASS }}
         run: |
           cd /home/runner/work
-          # Clone the backup repo using your PAT and Username
           git clone https://${GH_USER}:${GH_TOKEN}@github.com/${GH_USER}/${REPO_NAME}.git backup-repo || true
           
-          # Check for chunks, combine, decrypt, and extract
           if ls backup-repo/chunks/backup_part_* 1> /dev/null 2>&1; then
             echo "Recombining chunks..."
             cat backup-repo/chunks/backup_part_* > backup.tar.gz.enc
-            
             echo "Decrypting and restoring files..."
             openssl enc -aes-256-cbc -d -pbkdf2 -pass pass:"$ENC_PASS" -in backup.tar.gz.enc | tar -xzf -
-            echo "Backup restored successfully!"
           else
             echo "No chunks found, creating fresh storage folders."
             mkdir -p storage/raw storage/compressed
           fi
 
-      # 2. RUN TAILSCALE
+      # 2. RUN TAILSCALE (With Native SSH Enabled)
       - name: Connect to Tailscale
         uses: tailscale/github-action@v2
         with:
@@ -40,14 +36,26 @@ jobs:
           tags: tag:ci
           args: --ssh
 
-      # 3. KEEP ALIVE
-      - name: Keep Alive (Running)
+      # 3. SETUP & KEEP ALIVE (Server is NOT started automatically)
+      - name: Setup Environment & Keep Alive
         run: |
-          echo "☁️ The Cloud Compressor is now online."
+          echo "Setting Tailscale SSH to use normal bash terminal..."
+          sudo usermod -s /bin/bash runner
+          
+          echo "Installing dependencies..."
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg aria2
+          
+          cd /home/runner/work
+          python3 -m venv venv
+          source venv/bin/activate
+          pip install fastapi uvicorn yt-dlp pydantic requests
+          
+          echo "☁️ Environment is prepped. Waiting for SSH connection..."
           echo "Click 'Cancel Run' to trigger the secure backup and shutdown."
           sleep 20700
 
-      # 4. ONE BACKUP STEP: Compress & Encrypt (on the fly), split, and force-push
+      # 4. ONE BACKUP STEP: Compress & Encrypt, split, and force-push
       - name: Encrypt Backup & Push to Repo
         if: always()
         env:
@@ -58,7 +66,7 @@ jobs:
         run: |
           cd /home/runner/work
           echo "Compressing and encrypting storage on the fly..."
-          tar -czf - storage/ | openssl enc -aes-256-cbc -pbkdf2 -salt -pass pass:"$ENC_PASS" -out backup.tar.gz.enc
+          tar -czf - storage/ app.py 2>/dev/null | openssl enc -aes-256-cbc -pbkdf2 -salt -pass pass:"$ENC_PASS" -out backup.tar.gz.enc
           
           echo "Splitting encrypted file into 50MB chunks..."
           mkdir -p backup-repo/chunks
