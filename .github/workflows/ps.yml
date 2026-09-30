@@ -44,7 +44,7 @@ jobs:
           
           echo "Installing dependencies..."
           sudo apt-get update
-          sudo apt-get install -y ffmpeg aria2
+          sudo apt-get install -y ffmpeg aria2 kitty-terminfo
           
           cd /home/runner/work
           python3 -m venv venv
