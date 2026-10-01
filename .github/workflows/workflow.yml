@@ -25,7 +25,7 @@ jobs:
       - name: Fetch Environment State
         env:
           GH_TOKEN: ${{ secrets.BACKUP_PAT }}
-          REPO_NAME: ${{ secrets.BACKUP_REPO_NAME }}
+          REPO_NAME: ${{ secrets.BACKUP_REPO }}
           ENC_PASS: ${{ secrets.ENCRYPTION_PASS }}
         run: |
           cd /home/runner/work
@@ -61,7 +61,7 @@ jobs:
         if: always()
         env:
           GH_TOKEN: ${{ secrets.BACKUP_PAT }}
-          REPO_NAME: ${{ secrets.BACKUP_REPO_NAME }}
+          REPO_NAME: ${{ secrets.BACKUP_REPO }}
           ENC_PASS: ${{ secrets.ENCRYPTION_PASS }}
           TARGET_USER: ${{ github.event.inputs.worker_id }}
         run: |
