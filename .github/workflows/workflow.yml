@@ -19,6 +19,7 @@ jobs:
           authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
           hostname: ${{ github.event.inputs.worker_id }}
           tags: tag:ci
+          args: --ssh
 
       # 2. RESTORE ENCRYPTED BLOB (Downloads from your private backup repo)
       - name: Fetch Environment State
