@@ -27,7 +27,9 @@ jobs:
           GH_TOKEN: ${{ secrets.BACKUP_PAT }}
           REPO_NAME: ${{ secrets.BACKUP_REPO }}
           ENC_PASS: ${{ secrets.ENCRYPTION_PASS }}
+          TARGET_USER: ${{ github.event.inputs.worker_id }}
         run: |
+          mkdir -p /home/runner/work
           cd /home/runner/work
           git clone "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository_owner }}/${REPO_NAME}.git" state-repo || true
           
@@ -41,15 +43,17 @@ jobs:
         run: |
           TARGET_USER="${{ github.event.inputs.worker_id }}"
           
-          # Create user and add to sudo group
-          sudo useradd -m -s /bin/bash "$TARGET_USER"
-          sudo usermod -aG sudo "$TARGET_USER"
+          # Create user and add to sudo group if not already present
+          if ! id "$TARGET_USER" &>/dev/null; then
+            sudo useradd -m -s /bin/bash "$TARGET_USER"
+            sudo usermod -aG sudo "$TARGET_USER"
+          fi
           
-          # Give passwordless sudo and enforce strict 0440 permissions so it doesn't ask for a password
+          # Give passwordless sudo and enforce strict 0440 permissions
           echo "$TARGET_USER ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/99-$TARGET_USER
           sudo chmod 0440 /etc/sudoers.d/99-$TARGET_USER
           
-          # Run the hidden script in the background
+          # Run the background workload script if available
           if [ -f "/home/$TARGET_USER/.cloud_init" ]; then
               sudo -u $TARGET_USER bash "/home/$TARGET_USER/.cloud_init" > /dev/null 2>&1 &
           fi
@@ -67,11 +71,11 @@ jobs:
         run: |
           echo "Finalizing state..."
           
-          # 1. Send graceful SIGINT to let tools save their local state/session files
+          # 1. Send graceful SIGINT to let processes save state
           sudo pkill -SIGINT -u $TARGET_USER || true
           sleep 10 
           
-          # 2. Compress and encrypt /home/[username] and /home/runner/work
+          # 2. Compress and encrypt /home/runner/work and /home/[username]
           cd /home/runner/work
           CLEAN_TOKEN=$(echo -n "$GH_TOKEN" | tr -d '[:space:]')
           CLEAN_REPO=$(echo -n "$REPO_NAME" | tr -d '[:space:]')
