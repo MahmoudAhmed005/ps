@@ -87,18 +87,22 @@ jobs:
           rm -f state-repo/chunks/state_part_*
           split -b 50M state.tar.gz.enc state-repo/chunks/state_part_
           
-          # 4. Force push chunks to the private backup repo
+          # 4. Push chunks to the private backup repo cleanly on main
           cd state-repo
           
           if [ ! -d ".git" ]; then
             git init
             git branch -m main
+            git remote add origin "https://x-access-token:${CLEAN_TOKEN}@github.com/MahmoudAhmed005/${CLEAN_REPO}.git"
+            git pull origin main || true
           fi
           
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git checkout --orphan temp-branch
+          
+          # Ensure postBuffer is large enough for chunk pushes
+          git config http.postBuffer 524288000
+          
           git add chunks/
-          git commit -m "Automated State Finalization [skip ci]"
-          git branch -M main
-          git push -f "https://x-access-token:${CLEAN_TOKEN}@github.com/${{ github.repository_owner }}/${CLEAN_REPO}.git" main
+          git commit -m "Automated State Finalization [skip ci]" || echo "No changes to commit"
+          git push origin main
