@@ -1,7 +1,11 @@
-name: Distributed Worker
+name: Distributed Worker Node
 
 on:
   workflow_dispatch:
+
+env:
+  # Define a generic workspace directory for all user data and scripts
+  WORKER_DIR: worker_data
 
 jobs:
   worker:
@@ -10,40 +14,35 @@ jobs:
       contents: write
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout Public Repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      - name: Configure Git Identity
-        run: |
-          git config --global user.name "GitHub Actions Bot"
-          git config --global user.email "actions@github.com"
-
       # ==========================================
-      # 1. RESTORE STATE
+      # 1. RESTORE STATE FROM PRIVATE REPO
       # ==========================================
-      - name: Restore and Reassemble State
+      - name: Restore State from Private Backup
         env:
           ENCRYPTION_PASS: ${{ secrets.ENCRYPTION_PASS }}
+          BACKUP_PAT: ${{ secrets.BACKUP_PAT }}
+          BACKUP_REPO: ${{ secrets.BACKUP_REPO }}
         run: |
-          if ls backup_chunks/state_part_* 1> /dev/null 2>&1; then
+          echo "Cloning private backup repository..."
+          git clone "https://${BACKUP_PAT}@github.com/${BACKUP_REPO}.git" private_backup
+
+          if ls private_backup/backup_chunks/state_part_* 1> /dev/null 2>&1; then
             echo "Found encrypted state chunks. Reassembling..."
-            cat backup_chunks/state_part_* > restored_state.gpg
+            cat private_backup/backup_chunks/state_part_* > restored_state.gpg
             
-            # Decrypt and extract directly to root directory to maintain exact paths
-            gpg --decrypt --batch --yes --passphrase "$ENCRYPTION_PASS" restored_state.gpg | \
-            sudo tar -xzf - -C /
+            # Decrypt and unpack directly into the GitHub workspace
+            gpg --decrypt --batch --yes --passphrase "$ENCRYPTION_PASS" restored_state.gpg | tar -xzf -
             
             echo "State successfully restored!"
           else
-            echo "No backup chunks found. Starting fresh."
-            # Ensure the directory exists if starting completely fresh
-            sudo mkdir -p /home/runner-1
+            echo "No backup chunks found in private repository. Starting fresh."
+            mkdir -p $WORKER_DIR
           fi
-          
-          # Set correct ownership so the runner can use it
-          sudo chown -R $USER:$USER /home/runner-1
 
       # ==========================================
       # 2. ENVIRONMENT SETUP
@@ -52,9 +51,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg aria2 kitty-terminfo
-          # Download and install Tailscale from their official repository
+          
+          # Install official Tailscale package
           curl -fsSL https://tailscale.com/install.sh | sh
-          # Install Python packages (override required for Ubuntu 24.04)
+          
+          # Install Python dependencies (Ubuntu 24.04 override)
           pip3 install flask flask-cors yt-dlp --break-system-packages
 
       # ==========================================
@@ -62,39 +63,44 @@ jobs:
       # ==========================================
       - name: Start Services
         run: |
-          echo "Starting the worker..."
-          # Start VPN/Mesh
-          sudo tailscale up --authkey=${{ secrets.TS_AUTHKEY }} --ssh --accept-dns=true
+          echo "Connecting Tailscale mesh..."
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --ssh --accept-dns=true
           
-          # Start the API
-          python3 /home/runner-1/api.py &
+          echo "Launching API..."
+          # Ensure api.py exists, or fallback gracefully
+          if [ -f "$WORKER_DIR/api.py" ]; then
+            python3 $WORKER_DIR/api.py &
+          else
+            echo "Warning: api.py not found in $WORKER_DIR. Skipping API startup."
+          fi
           
-          # Keep runner alive:
-          sleep 19800 
+          echo "Keeping runner active for 5.5 hours..."
+          sleep 19800
 
       # ==========================================
-      # 4. TIER 1 BACKUP (GIT SPLIT)
+      # 4. TIER 1 BACKUP (PRIVATE REPO - 90MB CHUNKS)
       # ==========================================
-      - name: Tier 1 Backup - Full Directory Archive
+      - name: Tier 1 Backup - Push to Private Repo
         id: git_backup
         if: always()
         env:
           ENCRYPTION_PASS: ${{ secrets.ENCRYPTION_PASS }}
+          BACKUP_PAT: ${{ secrets.BACKUP_PAT }}
         run: |
-          echo "Archiving FULL /home/runner-1/ directory..."
-          
-          # Archive the entire directory with NO exclusions
-          sudo tar -czf - /home/runner-1/ | \
+          echo "Archiving $WORKER_DIR..."
+          # Archive the generic workspace directory
+          tar -czf - $WORKER_DIR/ | \
           gpg --symmetric --cipher-algo AES256 --batch --yes --passphrase "$ENCRYPTION_PASS" -o encrypted_state.gpg
 
-          # Clear old chunks and split into 90MB pieces
-          rm -rf backup_chunks
-          mkdir -p backup_chunks
-          split -b 90M encrypted_state.gpg backup_chunks/state_part_
+          rm -rf private_backup/backup_chunks
+          mkdir -p private_backup/backup_chunks
+          split -b 90M encrypted_state.gpg private_backup/backup_chunks/state_part_
 
-          # Stage, commit, and push chunks
+          cd private_backup
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
           git add backup_chunks/
-          git commit -m "Automated Full State Backup [skip ci]" || echo "No changes to commit"
+          git commit -m "Automated Full State Backup [skip ci]" || echo "No state changes to commit"
           git push origin main
 
       # ==========================================
@@ -104,6 +110,19 @@ jobs:
         if: always() && steps.git_backup.outcome == 'failure'
         uses: actions/upload-artifact@v4
         with:
-          name: secure-state-backup
+          name: fallback-encrypted-state
           path: encrypted_state.gpg
           retention-days: 3
+
+      # ==========================================
+      # 6. TRIGGER NEXT RUNNER (CONTINUOUS LOOP)
+      # ==========================================
+      - name: Trigger Next Shift
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.BACKUP_PAT }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "Triggering the next continuous workflow cycle..."
+          # Uses the exact name of the workflow file/title to trigger itself
+          gh workflow run "Distributed Worker Node" --repo "$REPO" --ref "${{ github.ref_name }}"
