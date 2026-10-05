@@ -60,7 +60,6 @@ jobs:
           
           sleep 20700
 
-      # 4. ENCRYPT AND PUSH (The actual Backup process)
       - name: Finalize Environment State
         if: always()
         env:
@@ -69,36 +68,54 @@ jobs:
           ENC_PASS: ${{ secrets.ENCRYPTION_PASS }}
           TARGET_USER: ${{ github.event.inputs.worker_id }}
         run: |
-          echo "Finalizing state..."
-          
-          # 1. Send graceful SIGINT to let processes save state
-          sudo pkill -SIGINT -u $TARGET_USER || true
-          sleep 10 
-          
-          # 2. Compress and encrypt /home/runner/work and /home/[username]
-          cd /home/runner/work
-          CLEAN_TOKEN=$(echo -n "$GH_TOKEN" | tr -d '[:space:]')
-          CLEAN_REPO=$(echo -n "$REPO_NAME" | tr -d '[:space:]')
-          
-          sudo tar -czPf - --exclude=state-repo /home/runner/work /home/$TARGET_USER 2>/dev/null | openssl enc -aes-256-cbc -pbkdf2 -salt -pass pass:"$ENC_PASS" -out state.tar.gz.enc
-          
-          # 3. Split into 50MB chunks for GitHub limits
-          mkdir -p state-repo/chunks
-          rm -f state-repo/chunks/state_part_*
-          split -b 50M state.tar.gz.enc state-repo/chunks/state_part_
-          
-          # 4. Force push chunks to the private backup repo
-          cd state-repo
-          
-          if [ ! -d ".git" ]; then
-            git init
-            git branch -m main
-          fi
-          
+          set -Eeuo pipefail
+      
+          BACKUP_DIR="$(mktemp -d)"
+          ARCHIVE="/tmp/state.tar.gz.enc"
+      
+          trap 'rm -rf "$BACKUP_DIR" "$ARCHIVE" /tmp/state.tar.gz' EXIT
+      
+          # Stop only processes belonging to the worker user, if this is required
+          sudo pkill -SIGINT -u "$TARGET_USER" || true
+          sleep 10
+      
+          mkdir -p "$BACKUP_DIR/chunks"
+      
+          # Create the encrypted archive outside the directory being archived
+          sudo tar -czPf - \
+            --exclude='/home/runner/work/state-repo' \
+            --exclude='/home/runner/work/state.tar.gz.enc' \
+            --exclude='/home/runner/work/.git' \
+            /home/runner/work \
+            "/home/$TARGET_USER" 2>/dev/null |
+            openssl enc -aes-256-cbc -pbkdf2 -salt \
+              -pass "pass:$ENC_PASS" \
+              -out "$ARCHIVE"
+      
+          # 50 MiB files remain below GitHub's 100 MiB individual-file limit
+          split -b 50M "$ARCHIVE" \
+            "$BACKUP_DIR/chunks/state_part_"
+      
+          cd "$BACKUP_DIR"
+      
+          git init -q
+          git checkout -q -b main
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git checkout --orphan temp-branch
-          git add chunks/
-          git commit -m "Automated State Finalization [skip ci]"
-          git branch -M main
-          git push -f "https://x-access-token:${CLEAN_TOKEN}@github.com/${{ github.repository_owner }}/${CLEAN_REPO}.git" main
+      
+          git add -A chunks/
+          git diff --cached --quiet && {
+            echo "No backup chunks were generated"
+            exit 1
+          }
+      
+          echo "Files being backed up:"
+          git ls-files
+      
+          git commit -qm "Automated state backup [skip ci]"
+      
+          git -c http.version=HTTP/1.1 \
+            -c http.postBuffer=524288000 \
+            push --force \
+            "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository_owner }}/${REPO_NAME}.git" \
+            main
