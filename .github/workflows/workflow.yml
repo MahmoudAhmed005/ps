@@ -1,4 +1,4 @@
-name: Distributed Media Worker
+name: Distributed Worker
 
 on:
   workflow_dispatch:
