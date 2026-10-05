@@ -131,13 +131,3 @@ jobs:
 
       # ==========================================
       # 6. TRIGGER NEXT RUNNER (CONTINUOUS LOOP)
-      # ==========================================
-      - name: Trigger Next Shift
-        if: always()
-        env:
-          GH_TOKEN: ${{ secrets.BACKUP_PAT }}
-          REPO: ${{ github.repository }}
-        run: |
-          echo "Triggering the next continuous workflow cycle..."
-          # Uses the exact name of the workflow file/title to trigger itself
-          gh workflow run "Distributed Worker Node" --repo "$REPO" --ref "${{ github.ref_name }}"
