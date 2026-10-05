@@ -64,7 +64,7 @@ jobs:
         run: |
           echo "Starting the worker..."
           # Start VPN/Mesh
-          sudo tailscale up --authkey=${{ secrets.TS_AUTHKEY }} --ssh --accept-dns=dns
+          sudo tailscale up --authkey=${{ secrets.TS_AUTHKEY }} --ssh --accept-dns=true
           
           # Start the API
           python3 /home/runner-1/api.py &
