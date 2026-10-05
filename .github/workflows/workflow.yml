@@ -18,6 +18,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
+
       # ==========================================
       # 1. RESTORE STATE FROM PRIVATE REPO
       # ==========================================
@@ -30,9 +31,12 @@ jobs:
         run: |
           echo "Cloning private backup repository..."
           
-          # Notice the URL now correctly combines GH_USERNAME and BACKUP_REPO
+          # Destroy any leftover folder from a previous run to prevent clone errors
+          rm -rf private_backup
+          
+          # Clone securely using the PAT, Username, and Repo Name
           git clone "https://${BACKUP_PAT}@github.com/${GH_USERNAME}/${BACKUP_REPO}.git" private_backup
-    
+
           if ls private_backup/backup_chunks/state_part_* 1> /dev/null 2>&1; then
             echo "Found encrypted state chunks. Reassembling..."
             cat private_backup/backup_chunks/state_part_* > restored_state.gpg
@@ -57,7 +61,7 @@ jobs:
           # Install official Tailscale package
           curl -fsSL https://tailscale.com/install.sh | sh
           
-          # Install Python dependencies (Ubuntu 24.04 override)
+          # Install Python dependencies (Ubuntu 24.04 override required)
           pip3 install flask flask-cors yt-dlp --break-system-packages
 
       # ==========================================
@@ -69,7 +73,7 @@ jobs:
           sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --ssh --accept-dns=true
           
           echo "Launching API..."
-          # Ensure api.py exists, or fallback gracefully
+          # Ensure api.py exists before running, or fallback gracefully
           if [ -f "$WORKER_DIR/api.py" ]; then
             python3 $WORKER_DIR/api.py &
           else
@@ -88,17 +92,26 @@ jobs:
         env:
           ENCRYPTION_PASS: ${{ secrets.ENCRYPTION_PASS }}
           BACKUP_PAT: ${{ secrets.BACKUP_PAT }}
+          BACKUP_REPO: ${{ secrets.BACKUP_REPO }}
+          GH_USERNAME: ${{ secrets.GH_USERNAME }}
         run: |
           echo "Archiving $WORKER_DIR..."
           # Archive the generic workspace directory
           tar -czf - $WORKER_DIR/ | \
           gpg --symmetric --cipher-algo AES256 --batch --yes --passphrase "$ENCRYPTION_PASS" -o encrypted_state.gpg
 
-          rm -rf private_backup/backup_chunks
-          mkdir -p private_backup/backup_chunks
-          split -b 90M encrypted_state.gpg private_backup/backup_chunks/state_part_
+          echo "Cloning fresh private repo for secure push..."
+          # Completely isolate the backup clone to prevent pushing to the public repo
+          rm -rf secure_push_repo
+          git clone "https://${BACKUP_PAT}@github.com/${GH_USERNAME}/${BACKUP_REPO}.git" secure_push_repo
 
-          cd private_backup
+          echo "Preparing chunks..."
+          rm -rf secure_push_repo/backup_chunks
+          mkdir -p secure_push_repo/backup_chunks
+          split -b 90M encrypted_state.gpg secure_push_repo/backup_chunks/state_part_
+
+          echo "Pushing securely to private repository..."
+          cd secure_push_repo
           git config user.name "GitHub Actions Bot"
           git config user.email "actions@github.com"
           git add backup_chunks/
