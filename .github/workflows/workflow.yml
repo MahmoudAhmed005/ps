@@ -4,7 +4,6 @@ on:
   workflow_dispatch:
 
 env:
-  # Define a generic workspace directory for all user data and scripts
   WORKER_DIR: worker_data
 
 jobs:
@@ -30,23 +29,19 @@ jobs:
           GH_USERNAME: ${{ secrets.GH_USERNAME }}
         run: |
           echo "Cloning private backup repository..."
-          
-          # Destroy any leftover folder from a previous run to prevent clone errors
           rm -rf private_backup
           
-          # Clone securely using the PAT, Username, and Repo Name
-          git clone "https://${BACKUP_PAT}@github.com/${GH_USERNAME}/${BACKUP_REPO}.git" private_backup
+          # Clone securely; if it fails, it will continue to the "else" block
+          git clone "https://${BACKUP_PAT}@github.com/${GH_USERNAME}/${BACKUP_REPO}.git" private_backup || true
 
           if ls private_backup/backup_chunks/state_part_* 1> /dev/null 2>&1; then
             echo "Found encrypted state chunks. Reassembling..."
             cat private_backup/backup_chunks/state_part_* > restored_state.gpg
             
-            # Decrypt and unpack directly into the GitHub workspace
             gpg --decrypt --batch --yes --passphrase "$ENCRYPTION_PASS" restored_state.gpg | tar -xzf -
-            
             echo "State successfully restored!"
           else
-            echo "No backup chunks found in private repository. Starting fresh."
+            echo "No backup chunks found or clone failed. Starting fresh."
             mkdir -p $WORKER_DIR
           fi
 
@@ -58,10 +53,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg aria2 kitty-terminfo
           
-          # Install official Tailscale package
           curl -fsSL https://tailscale.com/install.sh | sh
-          
-          # Install Python dependencies (Ubuntu 24.04 override required)
           pip3 install flask flask-cors yt-dlp --break-system-packages
 
       # ==========================================
@@ -73,7 +65,6 @@ jobs:
           sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --ssh --accept-dns=true
           
           echo "Launching API..."
-          # Ensure api.py exists before running, or fallback gracefully
           if [ -f "$WORKER_DIR/api.py" ]; then
             python3 $WORKER_DIR/api.py &
           else
@@ -84,7 +75,7 @@ jobs:
           sleep 19800
 
       # ==========================================
-      # 4. TIER 1 BACKUP (PRIVATE REPO - 90MB CHUNKS)
+      # 4. TIER 1 BACKUP (PRIVATE REPO PUSH)
       # ==========================================
       - name: Tier 1 Backup - Push to Private Repo
         id: git_backup
@@ -96,22 +87,30 @@ jobs:
           GH_USERNAME: ${{ secrets.GH_USERNAME }}
         run: |
           echo "Archiving $WORKER_DIR..."
-          # Archive the generic workspace directory
           tar -czf - $WORKER_DIR/ | \
           gpg --symmetric --cipher-algo AES256 --batch --yes --passphrase "$ENCRYPTION_PASS" -o encrypted_state.gpg
 
           echo "Cloning fresh private repo for secure push..."
-          # Completely isolate the backup clone to prevent pushing to the public repo
           rm -rf secure_push_repo
-          git clone "https://${BACKUP_PAT}@github.com/${GH_USERNAME}/${BACKUP_REPO}.git" secure_push_repo
+          git clone "https://${BACKUP_PAT}@github.com/${GH_USERNAME}/${BACKUP_REPO}.git" secure_push_repo || echo "Clone failed!"
 
           echo "Preparing chunks..."
           rm -rf secure_push_repo/backup_chunks
           mkdir -p secure_push_repo/backup_chunks
           split -b 90M encrypted_state.gpg secure_push_repo/backup_chunks/state_part_
 
-          echo "Pushing securely to private repository..."
           cd secure_push_repo
+          
+          # ========================================================
+          # CRITICAL SAFETY LOCK: Prevents pushing to public repo
+          # ========================================================
+          if [ ! -d ".git" ]; then
+            echo "FATAL: This is not a Git repository. The clone failed."
+            echo "Aborting backup to protect the public repository."
+            exit 1
+          fi
+
+          echo "Pushing securely to private repository..."
           git config user.name "GitHub Actions Bot"
           git config user.email "actions@github.com"
           git add backup_chunks/
@@ -131,3 +130,12 @@ jobs:
 
       # ==========================================
       # 6. TRIGGER NEXT RUNNER (CONTINUOUS LOOP)
+      # ==========================================
+      - name: Trigger Next Shift
+        if: success()  # Prevents infinite crash loops
+        env:
+          GH_TOKEN: ${{ secrets.BACKUP_PAT }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "Triggering the next continuous workflow cycle..."
+          gh workflow run "Distributed Worker Node" --repo "$REPO" --ref "${{ github.ref_name }}"
