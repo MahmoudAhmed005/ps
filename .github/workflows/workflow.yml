@@ -61,13 +61,13 @@ jobs:
         run: |
           echo "Starting the worker..."
           # Start VPN/Mesh
-          # sudo tailscale up --authkey=${{ secrets.TS_AUTHKEY }}
+          sudo tailscale up --authkey=${{ secrets.TS_AUTHKEY }}
           
           # Start the API
-          # python3 /home/runner-1/api.py &
+          python3 /home/runner-1/api.py &
           
           # Keep runner alive:
-          # sleep 19800 
+          sleep 19800 
 
       # ==========================================
       # 4. TIER 1 BACKUP (GIT SPLIT)
