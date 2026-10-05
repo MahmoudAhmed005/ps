@@ -51,8 +51,11 @@ jobs:
       - name: Setup Environment
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg aria2 kitty-terminfo tailscale
-          pip3 install flask flask-cors yt-dlp
+          sudo apt-get install -y ffmpeg aria2 kitty-terminfo
+          # Download and install Tailscale from their official repository
+          curl -fsSL https://tailscale.com/install.sh | sh
+          # Install Python packages (override required for Ubuntu 24.04)
+          pip3 install flask flask-cors yt-dlp --break-system-packages
 
       # ==========================================
       # 3. RUNNER EXECUTION
