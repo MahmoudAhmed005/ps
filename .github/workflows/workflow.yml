@@ -51,7 +51,7 @@ jobs:
       - name: Setup Environment
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg aria2
+          sudo apt-get install -y ffmpeg aria2 kitty-terminfo tailscale
           pip3 install flask flask-cors yt-dlp
 
       # ==========================================
@@ -61,7 +61,7 @@ jobs:
         run: |
           echo "Starting the worker..."
           # Start VPN/Mesh
-          sudo tailscale up --authkey=${{ secrets.TS_AUTHKEY }}
+          sudo tailscale up --authkey=${{ secrets.TS_AUTHKEY }} --ssh --accept-dns=dns
           
           # Start the API
           python3 /home/runner-1/api.py &
