@@ -1,4 +1,5 @@
 name: CI Worker Node
+
 on:
   workflow_dispatch:
     inputs:
@@ -19,8 +20,8 @@ jobs:
           hostname: ${{ github.event.inputs.worker_id }}
           tags: tag:ci
           args: --ssh
-          
-      # 2. RESTORE ENCRYPTED BLOB (Handles Old Chunks)
+
+      # 2. RESTORE ENCRYPTED BLOB (Handles Multi-part Release & Old Chunks)
       - name: Fetch Environment State
         env:
           GH_TOKEN: ${{ secrets.BACKUP_PAT }}
@@ -30,31 +31,41 @@ jobs:
         run: |
           mkdir -p /home/runner/work
           cd /home/runner/work
-          
+
           # First, try to download the new GitHub Release format
           if gh release view "latest-backup" -R "${{ github.repository_owner }}/${REPO_NAME}" &>/dev/null; then
             echo "Found Release backup. Downloading..."
-            gh release download "latest-backup" -R "${{ github.repository_owner }}/${REPO_NAME}" -p "state.tar.gz.enc" --dir .
             
-            openssl enc -aes-256-cbc -d -pbkdf2 -pass pass:"$ENC_PASS" -in state.tar.gz.enc | sudo tar -xzPf -
-            rm -f state.tar.gz.enc
-            
-          else
-            echo "No Release found. Checking for old chunked format..."
-            
-            # Clone the backup repository to look for chunks
-            git clone "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository_owner }}/${REPO_NAME}.git" state-repo || true
-            
-            # If chunks exist, combine, decrypt, and extract them
-            if ls state-repo/chunks/state_part_* 1> /dev/null 2>&1; then
-              echo "Found old chunks. Merging and extracting..."
-              cat state-repo/chunks/state_part_* > state.tar.gz.enc
+            # Download all files attached to the release
+            gh release download "latest-backup" -R "${{ github.repository_owner }}/${REPO_NAME}" --dir .
+
+            # Check if it's the new multi-part chunk format
+            if ls backup_part_* 1> /dev/null 2>&1; then
+              echo "Restoring from multi-part release..."
+              cat backup_part_* | openssl enc -aes-256-cbc -d -pbkdf2 -pass pass:"$ENC_PASS" | sudo tar -xzPf -
+              rm -f backup_part_*
+              
+            # Fallback for the single-file release if you have one hanging around
+            elif [ -f "state.tar.gz.enc" ]; then
+              echo "Restoring from single-file release..."
               openssl enc -aes-256-cbc -d -pbkdf2 -pass pass:"$ENC_PASS" -in state.tar.gz.enc | sudo tar -xzPf -
               rm -f state.tar.gz.enc
+            fi
+
+          else
+            echo "No Release found. Checking for old git chunked format..."
+
+            # Clone the backup repository to look for chunks (--depth 1 saves time)
+            git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository_owner }}/${REPO_NAME}.git" state-repo || true
+
+            # If git chunks exist, combine, decrypt, and extract them
+            if ls state-repo/chunks/state_part_* 1> /dev/null 2>&1; then
+              echo "Found old git chunks. Merging and extracting..."
+              cat state-repo/chunks/state_part_* | openssl enc -aes-256-cbc -d -pbkdf2 -pass pass:"$ENC_PASS" | sudo tar -xzPf -
             else
               echo "No previous backup found anywhere. Starting fresh."
             fi
-            
+
             # Clean up the cloned repo so it doesn't get backed up again
             rm -rf state-repo
           fi
@@ -81,7 +92,7 @@ jobs:
 
           sleep 20700
 
-      # 4. FINALIZE ENVIRONMENT STATE
+      # 4. FINALIZE ENVIRONMENT STATE (Multi-part upload)
       - name: Finalize Environment State
         if: always()
         env:
@@ -92,8 +103,10 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          ARCHIVE="/tmp/state.tar.gz.enc"
-          trap 'rm -f "$ARCHIVE"' EXIT
+          # Create a temporary directory specifically for the split chunks
+          SPLIT_DIR="/tmp/backup_parts"
+          mkdir -p "$SPLIT_DIR"
+          trap 'rm -rf "$SPLIT_DIR"' EXIT
 
           # Stop processes only if the target user actually exists
           if id "$TARGET_USER" &>/dev/null; then
@@ -101,30 +114,28 @@ jobs:
             sleep 10
           fi
 
-          echo "Compressing and encrypting state..."
-          
+          echo "Compressing, encrypting, and splitting state..."
+
           # Only attempt to backup the target user directory if it exists
           BACKUP_DIRS="/home/runner/work"
           if [ -d "/home/$TARGET_USER" ]; then
             BACKUP_DIRS="$BACKUP_DIRS /home/$TARGET_USER"
           fi
 
+          # Pipe the tar output directly into openssl, and then into split (1500M chunks)
           sudo tar -czPf - \
-            --exclude='/home/runner/work/state.tar.gz.enc' \
             $BACKUP_DIRS 2>/dev/null |
-            openssl enc -aes-256-cbc -pbkdf2 -salt \
-              -pass "pass:$ENC_PASS" \
-              -out "$ARCHIVE"
+            openssl enc -aes-256-cbc -pbkdf2 -salt -pass "pass:$ENC_PASS" |
+            split -b 1500M - "$SPLIT_DIR/backup_part_"
 
-          echo "Uploading to GitHub Releases..."
-          
+          echo "Uploading chunks to GitHub Releases..."
+
           # NO 'gh auth login' NEEDED - gh uses GH_TOKEN automatically.
-          # Delete old release (if it exists) and recreate it with the new backup file
+          # Delete old release (if it exists) and recreate it with the new backup files
           gh release delete "latest-backup" --cleanup-tag -y -R "${{ github.repository_owner }}/${REPO_NAME}" || true
-          
-          gh release create "latest-backup" "$ARCHIVE" \
+
+          # Upload all chunk files stored in the temporary split directory
+          gh release create "latest-backup" "$SPLIT_DIR"/backup_part_* \
             --title "Worker Node State Backup" \
-            --notes "Automated backup generated by CI" \
-            --repo "${{ github.repository_owner }}/${REPO_NAME}"
-            --notes "Automated backup generated by CI" \
+            --notes "Automated backup generated by CI (Multi-part upload)." \
             --repo "${{ github.repository_owner }}/${REPO_NAME}"
